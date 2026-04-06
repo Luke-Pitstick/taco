@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/taco.jpg" alt="taco mascot" width="160" />
+  <img src="assets/taco.jpg" alt="taco mascot" width="350" />
 </p>
 
 # taco
