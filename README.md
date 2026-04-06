@@ -55,13 +55,15 @@ uv run taco
 uv tool install /path/to/taco
 ```
 
-## Usage
+## Commands
+
+### `taco` / `taco setup`
+
+Set up Jupyter kernels for the current uv project. This is the default command — running `taco` with no subcommand does the same thing as `taco setup`.
 
 ```
-taco [--project PATH] [--name TEXT] [--display-name TEXT] [--no-marimo] [--dry-run]
+taco setup [--project PATH] [--name TEXT] [--display-name TEXT] [--no-marimo] [--dry-run]
 ```
-
-### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -70,6 +72,38 @@ taco [--project PATH] [--name TEXT] [--display-name TEXT] [--no-marimo] [--dry-r
 | `--display-name TEXT` | `Python (<project>)` | Human-readable kernel display name |
 | `--no-marimo` | `False` | Skip installing marimo and omit marimo guidance |
 | `--dry-run` | `False` | Preview all actions without making changes |
+
+### `taco remove`
+
+Remove the Jupyter kernel for a project. Checks both the project-local venv and user-level kernel directories.
+
+```
+taco remove [--project PATH] [--name TEXT] [--dry-run]
+```
+
+### `taco list`
+
+List all installed Jupyter kernels in a table showing name, display name, interpreter path, and VIRTUAL_ENV.
+
+```
+taco list
+```
+
+### `taco info`
+
+Show detailed info and health checks for a project's kernel — whether the interpreter exists, whether the VIRTUAL_ENV path is valid, the full command used to launch the kernel, etc.
+
+```
+taco info [--project PATH] [--name TEXT]
+```
+
+### `taco clean`
+
+Find and remove stale kernels whose Python interpreters no longer exist (e.g., from deleted venvs or old projects).
+
+```
+taco clean [--dry-run]
+```
 
 ### Examples
 
@@ -81,13 +115,28 @@ taco
 taco --dry-run
 
 # Custom kernel name
-taco --name ml-env --display-name "ML Environment"
+taco setup --name ml-env --display-name "ML Environment"
 
 # Skip marimo
-taco --no-marimo
+taco setup --no-marimo
 
 # Target a specific project
-taco --project ~/projects/my-api
+taco setup --project ~/projects/my-api
+
+# See all kernels on your system
+taco list
+
+# Check health of current project's kernel
+taco info
+
+# Delete the kernel for the current project
+taco remove
+
+# Clean up stale kernels from deleted projects
+taco clean
+
+# Preview what clean would remove
+taco clean --dry-run
 ```
 
 ## Using the kernel
