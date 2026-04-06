@@ -453,7 +453,7 @@ def run_setup(config: TacoConfig) -> None:
     # Success panel with next steps
     next_steps = Text()
     next_steps.append("Next steps\n\n", style="bold green")
-    next_steps.append("Cursor:  ", style="bold")
+    next_steps.append("VS Code: ", style="bold")
     next_steps.append(f'Open an .ipynb → select kernel "{config.display_name}"\n')
     next_steps.append("         ", style="bold")
     next_steps.append(
