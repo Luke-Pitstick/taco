@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/taco.svg" alt="taco mascot" width="160" />
+</p>
+
 # taco
 
 uv notebook bootstrapper — register per-project Jupyter kernels in one command.
