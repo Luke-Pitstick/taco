@@ -9,10 +9,12 @@ from unittest.mock import patch
 import pytest
 
 from taco.core import (
+    ProjectType,
     TacoConfig,
     _get_kernelspec_dir,
     compute_missing_deps,
     default_display_name,
+    detect_project_type,
     find_project_root,
     patch_kernelspec,
     sanitize_kernel_name,
@@ -34,9 +36,49 @@ def test_find_project_root_from_subdirectory(tmp_path: Path) -> None:
     assert find_project_root(sub) == tmp_path
 
 
+def test_find_project_root_from_requirements_txt(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text("requests\n")
+    assert find_project_root(tmp_path) == tmp_path
+
+
+def test_find_project_root_from_setup_py(tmp_path: Path) -> None:
+    (tmp_path / "setup.py").write_text("from setuptools import setup\nsetup()\n")
+    assert find_project_root(tmp_path) == tmp_path
+
+
 def test_find_project_root_fails_outside_project(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         find_project_root(tmp_path)
+
+
+# --- detect_project_type ---
+
+
+def test_detect_uv_project_by_lock(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (tmp_path / "uv.lock").write_text("")
+    assert detect_project_type(tmp_path) == ProjectType.UV
+
+
+def test_detect_uv_project_by_tool_section(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n\n[tool.uv]\n")
+    assert detect_project_type(tmp_path) == ProjectType.UV
+
+
+def test_detect_poetry_project_by_lock(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (tmp_path / "poetry.lock").write_text("")
+    assert detect_project_type(tmp_path) == ProjectType.POETRY
+
+
+def test_detect_poetry_project_by_tool_section(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.poetry]\nname = 'x'\n")
+    assert detect_project_type(tmp_path) == ProjectType.POETRY
+
+
+def test_detect_pip_project_by_requirements(tmp_path: Path) -> None:
+    (tmp_path / "requirements.txt").write_text("requests\n")
+    assert detect_project_type(tmp_path) == ProjectType.PIP
 
 
 # --- sanitize_kernel_name ---

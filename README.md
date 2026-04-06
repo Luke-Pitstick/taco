@@ -4,62 +4,77 @@
 
 # taco
 
-uv notebook bootstrapper — register per-project Jupyter kernels in one command.
+Notebook bootstrapper — register per-project Jupyter kernels in one command.
+
+Works with **uv**, **poetry**, and **plain pip/venv** projects.
 
 ## The problem
 
-When you use [uv](https://docs.astral.sh/uv/) to manage Python projects, each project gets its own isolated virtual environment. That's great for reproducibility, but it creates friction with notebooks:
+Python projects use isolated virtual environments, but notebooks don't play nicely with them out of the box:
 
 - **Jupyter** doesn't automatically see your project's venv or its installed packages.
 - **Cursor / VS Code** need a named kernel registered on your system before the kernel picker shows it.
 - **marimo** works directly from the project environment, but you still need to remember to install it.
 
-You end up running a sequence of `uv add`, `python -m ipykernel install`, and manual `kernel.json` edits every time you start a new project. `taco` does all of that in a single command.
+You end up running a sequence of dependency installs, `python -m ipykernel install`, and manual `kernel.json` edits every time you start a new project. `taco` does all of that in a single command.
 
 ## What it does
 
-Running `taco` inside a uv project will:
+Running `taco` inside any Python project will:
 
-1. **Detect your project** — finds the nearest `pyproject.toml` and resolves the `.venv` interpreter.
-2. **Sync notebook dependencies** — adds `ipykernel` and `marimo` as dev dependencies if they're missing (via `uv add --dev`).
-3. **Register a Jupyter kernel** — installs a user-level kernelspec named after your project folder (e.g., `my-project`) with display name `Python (my-project)`.
+1. **Detect your project** — finds the nearest `pyproject.toml`, `setup.py`, or `requirements.txt` and auto-detects whether you're using uv, poetry, or pip.
+2. **Sync notebook dependencies** — adds `ipykernel` and `marimo` using the right tool for your project (`uv add --dev`, `poetry add --group dev`, or `pip install`).
+3. **Register a Jupyter kernel** — installs a per-project kernelspec named after your project folder (e.g., `my-project`) with display name `Python (my-project)`.
 4. **Patch the kernelspec** — sets `VIRTUAL_ENV` in `kernel.json` so notebook frontends launched outside the venv still resolve packages correctly.
-5. **Print next steps** — copy-ready commands for Cursor, Jupyter Lab, and marimo.
+5. **Print next steps** — copy-ready commands tailored to your project type for Cursor, Jupyter Lab, and marimo.
 
 If the kernel already exists, it's replaced in place — safe to rerun after changing environments.
 
+## Supported project types
+
+| Project type | Detected by | Dep install command |
+|-------------|-------------|-------------------|
+| **uv** | `uv.lock` or `[tool.uv]` in pyproject.toml | `uv add --dev` |
+| **poetry** | `poetry.lock` or `[tool.poetry]` in pyproject.toml | `poetry add --group dev` |
+| **pip/venv** | `requirements.txt`, `setup.py`, or fallback | `pip install` (into the venv) |
+
+taco auto-detects the project type — no configuration needed. It also finds your virtualenv automatically (`.venv`, `venv`, or poetry's external venv location).
+
 ## Installation
 
-### System-wide (recommended)
-
-Install as a uv tool so `taco` is available in any project:
+### With uv (recommended)
 
 ```bash
 uv tool install taco
 ```
 
-Then just run `taco` from any uv project directory.
+Then run `taco` from any project directory.
 
-### Per-project
-
-Add it as a dev dependency:
+### With pipx
 
 ```bash
-uv add --dev taco
-uv run taco
+pipx install taco
+```
+
+### With pip
+
+```bash
+pip install taco
 ```
 
 ### From source
 
 ```bash
 uv tool install /path/to/taco
+# or
+pipx install /path/to/taco
 ```
 
 ## Commands
 
 ### `taco` / `taco setup`
 
-Set up Jupyter kernels for the current uv project. This is the default command — running `taco` with no subcommand does the same thing as `taco setup`.
+Set up Jupyter kernels for the current project. This is the default command — running `taco` with no subcommand does the same thing as `taco setup`.
 
 ```
 taco setup [--project PATH] [--name TEXT] [--display-name TEXT] [--no-marimo] [--dry-run]
@@ -67,7 +82,7 @@ taco setup [--project PATH] [--name TEXT] [--display-name TEXT] [--no-marimo] [-
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--project PATH` | Auto-detect (nearest `pyproject.toml`) | Path to the uv project root |
+| `--project PATH` | Auto-detect (nearest project root) | Path to the project root |
 | `--name TEXT` | Project folder name, sanitized | Kernel name slug (must match `[a-zA-Z0-9._-]+`) |
 | `--display-name TEXT` | `Python (<project>)` | Human-readable kernel display name |
 | `--no-marimo` | `False` | Skip installing marimo and omit marimo guidance |
@@ -108,7 +123,7 @@ taco clean [--dry-run]
 ### Examples
 
 ```bash
-# Basic — auto-detect everything
+# Basic — auto-detect everything (works in uv, poetry, or pip projects)
 taco
 
 # Preview what would happen
@@ -149,10 +164,17 @@ taco clean --dry-run
 
 ### Jupyter Lab
 
-taco doesn't install Jupyter Lab itself to keep your project lean. Launch it as a one-off:
+taco doesn't install Jupyter Lab itself to keep your project lean. Launch it with:
 
 ```bash
+# uv projects
 uv run --with jupyter jupyter lab
+
+# poetry projects
+poetry run jupyter lab
+
+# pip/venv projects
+jupyter lab
 ```
 
 Your project kernel will appear in the launcher and kernel picker.
@@ -162,18 +184,27 @@ Your project kernel will appear in the launcher and kernel picker.
 marimo runs directly from the project environment — no kernel needed:
 
 ```bash
+# uv projects
 uv run marimo edit notebook.py
+
+# poetry projects
+poetry run marimo edit notebook.py
+
+# pip/venv projects
+marimo edit notebook.py
 ```
 
-All packages in your project's dev and runtime dependencies are available.
+All packages in your project's dependencies are available.
 
 ## How it works
 
-Under the hood, taco runs:
+taco detects your project type and runs the equivalent of:
 
 ```bash
-# 1. Add missing deps
-uv add --dev ipykernel marimo
+# 1. Add missing deps (adapts to your package manager)
+uv add --dev ipykernel marimo          # uv
+poetry add --group dev ipykernel marimo # poetry
+pip install ipykernel marimo            # pip/venv
 
 # 2. Register the kernel inside the project venv
 .venv/bin/python -m ipykernel install --prefix .venv --name <slug> --display-name "<display>"
@@ -188,7 +219,7 @@ The kernelspec is installed per-project inside the venv:
 <project>/.venv/share/jupyter/kernels/<name>/
 ```
 
-This keeps kernels scoped to each project — no global pollution. Jupyter and Cursor discover them automatically when running from the project's venv (e.g., `uv run`).
+This keeps kernels scoped to each project — no global pollution. Jupyter and Cursor discover them automatically when running from the project's environment.
 
 The patched `kernel.json` looks like:
 
@@ -205,9 +236,9 @@ The patched `kernel.json` looks like:
 
 ## Requirements
 
-- [uv](https://docs.astral.sh/uv/) must be installed and available on `PATH`.
 - Python >= 3.10.
-- The target directory must be a uv project (has a `pyproject.toml`).
+- One of: [uv](https://docs.astral.sh/uv/), [poetry](https://python-poetry.org/), or pip (comes with Python).
+- The target directory must be a Python project (has a `pyproject.toml`, `setup.py`, `setup.cfg`, or `requirements.txt`).
 
 ## Development
 

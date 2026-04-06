@@ -41,7 +41,7 @@ def _make_kernel(project: Path, name: str = "testproj") -> Path:
 def test_help() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "uv notebook bootstrapper" in result.output
+    assert "notebook bootstrapper" in result.output
 
 
 def test_setup_help() -> None:

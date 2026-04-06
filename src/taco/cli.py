@@ -10,6 +10,7 @@ import typer
 from taco.core import (
     TacoConfig,
     default_display_name,
+    detect_project_type,
     find_project_root,
     run_clean,
     run_info,
@@ -21,7 +22,7 @@ from taco.core import (
 
 app = typer.Typer(
     name="taco",
-    help="🌮 uv notebook bootstrapper — register per-project Jupyter kernels in one command.",
+    help="🌮 notebook bootstrapper — register per-project Jupyter kernels in one command.",
     add_completion=False,
     invoke_without_command=True,
 )
@@ -37,12 +38,14 @@ def _resolve_config(
     """Build a TacoConfig from CLI args."""
     project_root = find_project_root(project)
     project_name = project_root.name
+    project_type = detect_project_type(project_root)
     kernel_name = name if name else sanitize_kernel_name(project_name)
     kernel_display = display_name if display_name else default_display_name(project_name)
     return TacoConfig(
         project_root=project_root,
         kernel_name=kernel_name,
         display_name=kernel_display,
+        project_type=project_type,
         include_marimo=not no_marimo,
         dry_run=dry_run,
     )
@@ -50,7 +53,7 @@ def _resolve_config(
 
 @app.callback()
 def main(ctx: typer.Context) -> None:
-    """🌮 uv notebook bootstrapper."""
+    """🌮 notebook bootstrapper."""
     if ctx.invoked_subcommand is None:
         # Default to setup when no subcommand is given
         ctx.invoke(setup)
@@ -60,7 +63,7 @@ def main(ctx: typer.Context) -> None:
 def setup(
     project: Optional[Path] = typer.Option(
         None,
-        help="Path to the uv project root (default: auto-detect).",
+        help="Path to the project root (default: auto-detect).",
     ),
     name: Optional[str] = typer.Option(
         None,
@@ -82,7 +85,7 @@ def setup(
         help="Show what would happen without making changes.",
     ),
 ) -> None:
-    """Set up Jupyter kernels for the current uv project (default command)."""
+    """Set up Jupyter kernels for the current project (default command)."""
     config = _resolve_config(project, name, display_name, no_marimo, dry_run)
     run_setup(config)
 

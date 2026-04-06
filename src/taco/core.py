@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from rich.console import Console
@@ -19,6 +20,12 @@ from rich.text import Text
 console = Console()
 
 
+class ProjectType(Enum):
+    UV = "uv"
+    POETRY = "poetry"
+    PIP = "pip"
+
+
 @dataclass
 class TacoConfig:
     """Resolved configuration for a taco run."""
@@ -26,28 +33,94 @@ class TacoConfig:
     project_root: Path
     kernel_name: str
     display_name: str
+    project_type: ProjectType = ProjectType.UV
     include_marimo: bool = True
     dry_run: bool = False
     venv_path: Path = field(init=False)
     interpreter: Path = field(init=False)
 
     def __post_init__(self) -> None:
-        self.venv_path = self.project_root / ".venv"
+        self.venv_path = _find_venv(self.project_root, self.project_type)
         self.interpreter = self.venv_path / "bin" / "python"
 
 
-def find_project_root(start: Path | None = None) -> Path:
-    """Walk up from *start* (default: cwd) to find the nearest pyproject.toml.
+def _find_venv(project_root: Path, project_type: ProjectType) -> Path:
+    """Locate the virtual environment for the project."""
+    # Check common venv locations
+    for name in (".venv", "venv"):
+        candidate = project_root / name
+        if (candidate / "bin" / "python").exists() or (candidate / "Scripts" / "python.exe").exists():
+            return candidate
 
+    # For poetry, ask poetry where the venv is
+    if project_type == ProjectType.POETRY:
+        try:
+            result = subprocess.run(
+                ["poetry", "env", "info", "-p"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode == 0:
+                venv_path = Path(result.stdout.strip())
+                if venv_path.exists():
+                    return venv_path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # Default to .venv (will be created during dep sync)
+    return project_root / ".venv"
+
+
+def detect_project_type(project_root: Path) -> ProjectType:
+    """Detect what kind of Python project this is."""
+    # Check for uv markers first
+    if (project_root / "uv.lock").exists():
+        return ProjectType.UV
+    pyproject = project_root / "pyproject.toml"
+    if pyproject.exists():
+        content = pyproject.read_text()
+        if "[tool.uv]" in content:
+            return ProjectType.UV
+        # Check for poetry markers
+        if (project_root / "poetry.lock").exists():
+            return ProjectType.POETRY
+        if "[tool.poetry]" in content:
+            return ProjectType.POETRY
+
+    # Check for pip markers
+    if (project_root / "requirements.txt").exists():
+        return ProjectType.PIP
+
+    # If there's a pyproject.toml but no specific markers, check if uv is available
+    if pyproject.exists():
+        try:
+            result = subprocess.run(["uv", "--version"], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                return ProjectType.UV
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return ProjectType.PIP
+
+    return ProjectType.PIP
+
+
+def find_project_root(start: Path | None = None) -> Path:
+    """Walk up from *start* (default: cwd) to find the nearest project root.
+
+    Looks for pyproject.toml, setup.py, setup.cfg, or requirements.txt.
     Returns the directory containing it, or raises SystemExit.
     """
+    markers = ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt")
     current = (start or Path.cwd()).resolve()
     for directory in [current, *current.parents]:
-        if (directory / "pyproject.toml").is_file():
-            return directory
+        for marker in markers:
+            if (directory / marker).is_file():
+                return directory
     raise SystemExit(
-        "[red]Error:[/red] No pyproject.toml found. "
-        "Run taco from inside a uv project."
+        "[red]Error:[/red] No Python project found. "
+        "Run taco from inside a project with pyproject.toml, setup.py, or requirements.txt."
     )
 
 
@@ -88,20 +161,50 @@ def compute_missing_deps(
     return [p for p in packages if not _is_package_importable(interpreter, p)]
 
 
-def add_dev_deps(project_root: Path, packages: list[str], dry_run: bool) -> bool:
-    """Run ``uv add --dev`` for the given packages. Returns True if anything was added."""
+def add_dev_deps(config: TacoConfig, packages: list[str]) -> bool:
+    """Install missing packages using the appropriate package manager."""
     if not packages:
         return False
-    cmd = ["uv", "add", "--dev", "--project", str(project_root), *packages]
-    if dry_run:
+
+    if config.project_type == ProjectType.UV:
+        cmd = ["uv", "add", "--dev", "--project", str(config.project_root), *packages]
+    elif config.project_type == ProjectType.POETRY:
+        cmd = ["poetry", "add", "--group", "dev", *packages]
+    else:
+        # pip — install into the venv directly
+        cmd = [str(config.interpreter), "-m", "pip", "install", *packages]
+
+    if config.dry_run:
         console.print(f"  [dim]Would run:[/dim] {' '.join(cmd)}")
         return True
-    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(config.project_root),
+    )
     if result.returncode != 0:
+        tool = config.project_type.value
         raise SystemExit(
-            f"[red]Error:[/red] uv add failed:\n{result.stderr}"
+            f"[red]Error:[/red] {tool} install failed:\n{result.stderr}"
         )
     return True
+
+
+def _ensure_venv(config: TacoConfig) -> None:
+    """Create a virtual environment if one doesn't exist (pip projects only)."""
+    if config.venv_path.exists():
+        return
+    if config.project_type != ProjectType.PIP:
+        return
+    if config.dry_run:
+        console.print(f"  [dim]Would run:[/dim] python -m venv {config.venv_path}")
+        return
+    subprocess.run(
+        [sys.executable, "-m", "venv", str(config.venv_path)],
+        check=True,
+    )
 
 
 def install_kernel(config: TacoConfig) -> Path:
@@ -250,16 +353,48 @@ def read_kernel_info(kernelspec_dir: Path) -> dict | None:
         return None
 
 
+def _project_type_label(project_type: ProjectType) -> str:
+    """Human-readable label for the project type."""
+    return {
+        ProjectType.UV: "uv",
+        ProjectType.POETRY: "poetry",
+        ProjectType.PIP: "pip/venv",
+    }[project_type]
+
+
+def _jupyter_launch_hint(config: TacoConfig) -> str:
+    """Return the recommended Jupyter Lab launch command for this project type."""
+    if config.project_type == ProjectType.UV:
+        return "uv run --with jupyter jupyter lab"
+    elif config.project_type == ProjectType.POETRY:
+        return "poetry run jupyter lab"
+    else:
+        return "jupyter lab"
+
+
+def _marimo_launch_hint(config: TacoConfig) -> str:
+    """Return the recommended marimo launch command for this project type."""
+    if config.project_type == ProjectType.UV:
+        return "uv run marimo edit notebook.py"
+    elif config.project_type == ProjectType.POETRY:
+        return "poetry run marimo edit notebook.py"
+    else:
+        return "marimo edit notebook.py"
+
+
 def run_setup(config: TacoConfig) -> None:
     """Execute the full taco setup workflow with rich output."""
     project_name = config.project_root.name
+    type_label = _project_type_label(config.project_type)
 
     # Title panel
     title = Text()
     title.append("🌮 taco", style="bold magenta")
-    title.append(" — uv notebook bootstrapper\n\n")
+    title.append(" — notebook bootstrapper\n\n")
     title.append("Project:     ", style="bold")
     title.append(f"{project_name}\n")
+    title.append("Type:        ", style="bold")
+    title.append(f"{type_label}\n")
     title.append("Interpreter: ", style="bold")
     title.append(f"{config.interpreter}\n")
     title.append("Kernel:      ", style="bold")
@@ -267,18 +402,25 @@ def run_setup(config: TacoConfig) -> None:
     console.print(Panel(title, border_style="magenta"))
 
     # Step 1: Project detection
-    console.print("\n[bold]1.[/bold] Project detection")
+    console.print(f"\n[bold]1.[/bold] Project detection [dim]({type_label})[/dim]")
     if config.venv_path.exists() or config.dry_run:
-        console.print(f"   [green]✓[/green] Found uv project at [cyan]{config.project_root}[/cyan]")
+        console.print(f"   [green]✓[/green] Found {type_label} project at [cyan]{config.project_root}[/cyan]")
     else:
-        console.print(f"   [yellow]![/yellow] No .venv found — uv will create one during dependency sync")
+        if config.project_type == ProjectType.PIP:
+            console.print(f"   [yellow]![/yellow] No venv found — will create one")
+            _ensure_venv(config)
+            if not config.dry_run:
+                # Re-resolve interpreter after creating venv
+                config.interpreter = config.venv_path / "bin" / "python"
+        else:
+            console.print(f"   [yellow]![/yellow] No venv found — {type_label} will create one during dependency sync")
 
     # Step 2: Dependency sync
     console.print("\n[bold]2.[/bold] Dependency sync")
     missing = compute_missing_deps(config.interpreter, config.include_marimo)
     if missing:
         console.print(f"   [yellow]→[/yellow] Adding missing deps: [cyan]{', '.join(missing)}[/cyan]")
-        add_dev_deps(config.project_root, missing, config.dry_run)
+        add_dev_deps(config, missing)
         console.print(f"   [green]✓[/green] Dependencies synced")
     else:
         console.print("   [green]✓[/green] All notebook dependencies already present")
@@ -310,10 +452,10 @@ def run_setup(config: TacoConfig) -> None:
     next_steps.append("         ", style="bold")
     next_steps.append("If missing, install the Jupyter extension (ms-toolsai.jupyter)\n\n")
     next_steps.append("Jupyter: ", style="bold")
-    next_steps.append("uv run --with jupyter jupyter lab\n\n")
+    next_steps.append(f"{_jupyter_launch_hint(config)}\n\n")
     if config.include_marimo:
         next_steps.append("marimo:  ", style="bold")
-        next_steps.append("uv run marimo edit notebook.py")
+        next_steps.append(_marimo_launch_hint(config))
 
     console.print()
     console.print(Panel(next_steps, border_style="green"))
