@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 console = Console()
@@ -132,6 +136,94 @@ def _get_kernelspec_dir(config: TacoConfig) -> Path:
     return config.venv_path / "share" / "jupyter" / "kernels" / config.kernel_name
 
 
+def get_all_kernel_dirs() -> list[Path]:
+    """Return all standard kernel search directories for this platform."""
+    dirs: list[Path] = []
+    # User-level
+    if sys.platform == "darwin":
+        dirs.append(Path.home() / "Library" / "Jupyter" / "kernels")
+    else:
+        dirs.append(
+            Path(
+                os.environ.get(
+                    "JUPYTER_DATA_DIR",
+                    Path.home() / ".local" / "share" / "jupyter",
+                )
+            )
+            / "kernels"
+        )
+    # System-level
+    if sys.platform == "darwin":
+        dirs.append(Path("/usr/local/share/jupyter/kernels"))
+        dirs.append(Path("/usr/share/jupyter/kernels"))
+    else:
+        dirs.append(Path("/usr/local/share/jupyter/kernels"))
+        dirs.append(Path("/usr/share/jupyter/kernels"))
+    return dirs
+
+
+def discover_kernels() -> list[dict]:
+    """Find all installed Jupyter kernels across user and system locations.
+
+    Returns a list of dicts with keys: name, path, display_name, interpreter, virtual_env.
+    """
+    kernels: list[dict] = []
+    seen_names: set[str] = set()
+
+    for kernel_base in get_all_kernel_dirs():
+        if not kernel_base.is_dir():
+            continue
+        for entry in sorted(kernel_base.iterdir()):
+            kernel_json = entry / "kernel.json"
+            if not kernel_json.is_file():
+                continue
+            name = entry.name
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            try:
+                data = json.loads(kernel_json.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            argv = data.get("argv", [])
+            kernels.append({
+                "name": name,
+                "path": str(entry),
+                "display_name": data.get("display_name", name),
+                "interpreter": argv[0] if argv else "unknown",
+                "virtual_env": data.get("env", {}).get("VIRTUAL_ENV", ""),
+            })
+    return kernels
+
+
+def remove_kernel(kernel_name: str, dry_run: bool = False) -> bool:
+    """Remove a kernel by name from all known locations. Returns True if anything was removed."""
+    removed = False
+    for kernel_base in get_all_kernel_dirs():
+        kernel_dir = kernel_base / kernel_name
+        if kernel_dir.is_dir():
+            if dry_run:
+                console.print(f"  [dim]Would remove:[/dim] {kernel_dir}")
+            else:
+                shutil.rmtree(kernel_dir)
+                console.print(f"  [green]✓[/green] Removed [cyan]{kernel_dir}[/cyan]")
+            removed = True
+    return removed
+
+
+def remove_project_kernel(config: TacoConfig) -> bool:
+    """Remove the project-local kernelspec."""
+    kernelspec_dir = _get_kernelspec_dir(config)
+    if not kernelspec_dir.is_dir():
+        return False
+    if config.dry_run:
+        console.print(f"  [dim]Would remove:[/dim] {kernelspec_dir}")
+        return True
+    shutil.rmtree(kernelspec_dir)
+    console.print(f"  [green]✓[/green] Removed [cyan]{kernelspec_dir}[/cyan]")
+    return True
+
+
 def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:
     """Patch kernel.json to include VIRTUAL_ENV so out-of-venv frontends work."""
     kernel_json = kernelspec_dir / "kernel.json"
@@ -145,6 +237,17 @@ def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:
     env["VIRTUAL_ENV"] = str(config.venv_path)
     data["env"] = env
     kernel_json.write_text(json.dumps(data, indent=1) + "\n")
+
+
+def read_kernel_info(kernelspec_dir: Path) -> dict | None:
+    """Read and return the parsed kernel.json, or None if missing."""
+    kernel_json = kernelspec_dir / "kernel.json"
+    if not kernel_json.is_file():
+        return None
+    try:
+        return json.loads(kernel_json.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def run_setup(config: TacoConfig) -> None:
@@ -216,3 +319,126 @@ def run_setup(config: TacoConfig) -> None:
     console.print(Panel(next_steps, border_style="green"))
 
     console.print(f"\n[bold]Kernel name:[/bold] [cyan]{config.kernel_name}[/cyan]")
+
+
+def run_list() -> None:
+    """List all installed Jupyter kernels in a table."""
+    kernels = discover_kernels()
+    if not kernels:
+        console.print("[yellow]No Jupyter kernels found.[/yellow]")
+        return
+
+    table = Table(title="🌮 Installed Jupyter Kernels", border_style="magenta")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Display Name", style="white")
+    table.add_column("Interpreter", style="dim")
+    table.add_column("VIRTUAL_ENV", style="dim")
+
+    for k in kernels:
+        table.add_row(
+            k["name"],
+            k["display_name"],
+            k["interpreter"],
+            k["virtual_env"] or "—",
+        )
+
+    console.print(table)
+
+
+def run_info(config: TacoConfig) -> None:
+    """Show detailed info about the project's kernel."""
+    kernelspec_dir = _get_kernelspec_dir(config)
+    data = read_kernel_info(kernelspec_dir)
+
+    console.print(Panel(
+        f"[bold magenta]🌮 Kernel info:[/bold magenta] [cyan]{config.kernel_name}[/cyan]",
+        border_style="magenta",
+    ))
+
+    if data is None:
+        # Check user-level too
+        for base in get_all_kernel_dirs():
+            alt = base / config.kernel_name
+            data = read_kernel_info(alt)
+            if data is not None:
+                kernelspec_dir = alt
+                break
+
+    if data is None:
+        console.print(f"\n[yellow]Kernel [cyan]{config.kernel_name}[/cyan] is not installed.[/yellow]")
+        console.print("Run [bold]taco[/bold] to create it.")
+        return
+
+    argv = data.get("argv", [])
+    env = data.get("env", {})
+
+    console.print(f"\n[bold]Location:[/bold]     {kernelspec_dir}")
+    console.print(f"[bold]Display name:[/bold] {data.get('display_name', '—')}")
+    console.print(f"[bold]Language:[/bold]     {data.get('language', '—')}")
+    console.print(f"[bold]Interpreter:[/bold]  {argv[0] if argv else '—'}")
+    console.print(f"[bold]Command:[/bold]      {' '.join(argv)}")
+    if env.get("VIRTUAL_ENV"):
+        console.print(f"[bold]VIRTUAL_ENV:[/bold]  {env['VIRTUAL_ENV']}")
+
+    # Health checks
+    console.print("\n[bold]Health checks:[/bold]")
+    interpreter = Path(argv[0]) if argv else None
+    if interpreter and interpreter.exists():
+        console.print(f"  [green]✓[/green] Interpreter exists")
+    else:
+        console.print(f"  [red]✗[/red] Interpreter not found: {argv[0] if argv else 'none'}")
+
+    venv = env.get("VIRTUAL_ENV")
+    if venv and Path(venv).exists():
+        console.print(f"  [green]✓[/green] VIRTUAL_ENV exists")
+    elif venv:
+        console.print(f"  [red]✗[/red] VIRTUAL_ENV path missing: {venv}")
+    else:
+        console.print(f"  [yellow]![/yellow] No VIRTUAL_ENV set")
+
+
+def run_remove(config: TacoConfig) -> None:
+    """Remove the kernel for the current project."""
+    console.print(f"[bold]Removing kernel:[/bold] [cyan]{config.kernel_name}[/cyan]\n")
+
+    removed = remove_project_kernel(config)
+
+    # Also check user-level locations
+    if not config.dry_run:
+        removed = remove_kernel(config.kernel_name) or removed
+
+    if not removed:
+        console.print(f"[yellow]Kernel [cyan]{config.kernel_name}[/cyan] not found — nothing to remove.[/yellow]")
+    else:
+        console.print(f"\n[green]Done.[/green] Kernel [cyan]{config.kernel_name}[/cyan] removed.")
+
+
+def run_clean(dry_run: bool = False) -> None:
+    """Find and remove kernels whose interpreters no longer exist."""
+    kernels = discover_kernels()
+    stale: list[dict] = []
+
+    for k in kernels:
+        interpreter = Path(k["interpreter"])
+        if not interpreter.exists():
+            stale.append(k)
+
+    if not stale:
+        console.print("[green]All kernels are healthy — no stale kernels found.[/green]")
+        return
+
+    console.print(f"[bold]Found {len(stale)} stale kernel(s):[/bold]\n")
+    for k in stale:
+        console.print(f"  [red]✗[/red] [cyan]{k['name']}[/cyan] — interpreter missing: [dim]{k['interpreter']}[/dim]")
+
+    console.print()
+    for k in stale:
+        kernel_dir = Path(k["path"])
+        if dry_run:
+            console.print(f"  [dim]Would remove:[/dim] {kernel_dir}")
+        else:
+            shutil.rmtree(kernel_dir)
+            console.print(f"  [green]✓[/green] Removed [cyan]{k['name']}[/cyan]")
+
+    if not dry_run:
+        console.print(f"\n[green]Done.[/green] Removed {len(stale)} stale kernel(s).")
