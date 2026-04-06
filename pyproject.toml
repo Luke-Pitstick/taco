@@ -1,6 +1,6 @@
 [project]
 name = "taco"
-version = "0.1.0"
+version = "0.2.0"
 description = "uv notebook bootstrapper — register per-project Jupyter kernels in one command"
 readme = "README.md"
 requires-python = ">=3.10"
