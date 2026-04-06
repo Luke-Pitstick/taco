@@ -126,16 +126,20 @@ Under the hood, taco runs:
 # 1. Add missing deps
 uv add --dev ipykernel marimo
 
-# 2. Register the kernel using the project's own interpreter
-.venv/bin/python -m ipykernel install --user --name <slug> --display-name "<display>"
+# 2. Register the kernel inside the project venv
+.venv/bin/python -m ipykernel install --prefix .venv --name <slug> --display-name "<display>"
 
 # 3. Patch kernel.json to include VIRTUAL_ENV
 # This ensures frontends launched outside the venv resolve packages correctly
 ```
 
-The kernelspec is installed to the standard user location:
-- **macOS**: `~/Library/Jupyter/kernels/<name>/`
-- **Linux**: `~/.local/share/jupyter/kernels/<name>/`
+The kernelspec is installed per-project inside the venv:
+
+```
+<project>/.venv/share/jupyter/kernels/<name>/
+```
+
+This keeps kernels scoped to each project — no global pollution. Jupyter and Cursor discover them automatically when running from the project's venv (e.g., `uv run`).
 
 The patched `kernel.json` looks like:
 

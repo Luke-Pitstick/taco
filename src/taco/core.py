@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -103,37 +101,35 @@ def add_dev_deps(project_root: Path, packages: list[str], dry_run: bool) -> bool
 
 
 def install_kernel(config: TacoConfig) -> Path:
-    """Install the ipykernel kernelspec and return the kernelspec directory."""
+    """Install the ipykernel kernelspec into the project venv and return the kernelspec directory."""
     cmd = [
         str(config.interpreter),
         "-m",
         "ipykernel",
         "install",
-        "--user",
+        "--prefix",
+        str(config.venv_path),
         "--name",
         config.kernel_name,
         "--display-name",
         config.display_name,
     ]
+    kernelspec_dir = _get_kernelspec_dir(config)
     if config.dry_run:
         console.print(f"  [dim]Would run:[/dim] {' '.join(cmd)}")
-        return _get_kernelspec_dir(config.kernel_name)
+        return kernelspec_dir
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise SystemExit(
             f"[red]Error:[/red] Kernel install failed:\n{result.stderr}"
         )
-    return _get_kernelspec_dir(config.kernel_name)
+    return kernelspec_dir
 
 
-def _get_kernelspec_dir(kernel_name: str) -> Path:
-    """Return the expected user kernelspec directory for a given kernel name."""
-    if sys.platform == "darwin":
-        base = Path.home() / "Library" / "Jupyter" / "kernels"
-    else:
-        base = Path(os.environ.get("JUPYTER_DATA_DIR", Path.home() / ".local" / "share" / "jupyter")) / "kernels"
-    return base / kernel_name
+def _get_kernelspec_dir(config: TacoConfig) -> Path:
+    """Return the project-local kernelspec directory."""
+    return config.venv_path / "share" / "jupyter" / "kernels" / config.kernel_name
 
 
 def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:

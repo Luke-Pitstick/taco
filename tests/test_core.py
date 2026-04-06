@@ -10,6 +10,7 @@ import pytest
 
 from taco.core import (
     TacoConfig,
+    _get_kernelspec_dir,
     compute_missing_deps,
     default_display_name,
     find_project_root,
@@ -87,6 +88,21 @@ def test_compute_missing_deps_no_marimo() -> None:
     with patch("taco.core._is_package_importable", return_value=False):
         result = compute_missing_deps(Path("/fake/python"), include_marimo=False)
     assert result == ["ipykernel"]
+
+
+# --- _get_kernelspec_dir ---
+
+
+def test_kernelspec_dir_is_inside_project_venv(tmp_path: Path) -> None:
+    project_root = tmp_path / "my-project"
+    project_root.mkdir()
+    config = TacoConfig(
+        project_root=project_root,
+        kernel_name="my-project",
+        display_name="Python (my-project)",
+    )
+    result = _get_kernelspec_dir(config)
+    assert result == project_root / ".venv" / "share" / "jupyter" / "kernels" / "my-project"
 
 
 # --- patch_kernelspec ---
