@@ -24,7 +24,6 @@ app = typer.Typer(
     name="taco",
     help="🌮 notebook bootstrapper — register per-project Jupyter kernels in one command.",
     add_completion=False,
-    invoke_without_command=True,
 )
 
 
@@ -40,7 +39,9 @@ def _resolve_config(
     project_name = project_root.name
     project_type = detect_project_type(project_root)
     kernel_name = name if name else sanitize_kernel_name(project_name)
-    kernel_display = display_name if display_name else default_display_name(project_name)
+    kernel_display = (
+        display_name if display_name else default_display_name(project_name)
+    )
     return TacoConfig(
         project_root=project_root,
         kernel_name=kernel_name,
@@ -51,12 +52,48 @@ def _resolve_config(
     )
 
 
-@app.callback()
-def main(ctx: typer.Context) -> None:
+def _run_setup(
+    project: Path | None = None,
+    name: str | None = None,
+    display_name: str | None = None,
+    no_marimo: bool = False,
+    dry_run: bool = False,
+) -> None:
+    """Shared setup logic used by both the default callback and the setup command."""
+    config = _resolve_config(project, name, display_name, no_marimo, dry_run)
+    run_setup(config)
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    project: Optional[Path] = typer.Option(
+        None,
+        help="Path to the project root (default: auto-detect).",
+    ),
+    name: Optional[str] = typer.Option(
+        None,
+        help="Kernel name slug (default: project folder name).",
+    ),
+    display_name: Optional[str] = typer.Option(
+        None,
+        "--display-name",
+        help="Kernel display name (default: 'Python (<project>)').",
+    ),
+    no_marimo: bool = typer.Option(
+        False,
+        "--no-marimo",
+        help="Skip marimo dependency and guidance.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would happen without making changes.",
+    ),
+) -> None:
     """🌮 notebook bootstrapper."""
     if ctx.invoked_subcommand is None:
-        # Default to setup when no subcommand is given
-        ctx.invoke(setup)
+        _run_setup(project, name, display_name, no_marimo, dry_run)
 
 
 @app.command()
@@ -85,16 +122,15 @@ def setup(
         help="Show what would happen without making changes.",
     ),
 ) -> None:
-    """Set up Jupyter kernels for the current project (default command)."""
-    config = _resolve_config(project, name, display_name, no_marimo, dry_run)
-    run_setup(config)
+    """Set up Jupyter kernels for the current project."""
+    _run_setup(project, name, display_name, no_marimo, dry_run)
 
 
 @app.command()
 def remove(
     project: Optional[Path] = typer.Option(
         None,
-        help="Path to the uv project root (default: auto-detect).",
+        help="Path to the project root (default: auto-detect).",
     ),
     name: Optional[str] = typer.Option(
         None,
@@ -121,7 +157,7 @@ def list_kernels() -> None:
 def info(
     project: Optional[Path] = typer.Option(
         None,
-        help="Path to the uv project root (default: auto-detect).",
+        help="Path to the project root (default: auto-detect).",
     ),
     name: Optional[str] = typer.Option(
         None,

@@ -13,11 +13,36 @@ from taco.cli import app
 runner = CliRunner()
 
 
-def _make_project(tmp_path: Path) -> Path:
-    """Create a minimal uv project scaffold in a fixed-name subdirectory."""
-    project = tmp_path / "testproj"
+def _make_project(tmp_path: Path, name: str = "testproj") -> Path:
+    """Create a minimal project scaffold in a fixed-name subdirectory."""
+    project = tmp_path / name
     project.mkdir()
-    (project / "pyproject.toml").write_text("[project]\nname = 'testproj'\n")
+    (project / "pyproject.toml").write_text(f"[project]\nname = '{name}'\n")
+    venv = project / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text("#!/bin/sh\n")
+    (venv / "python").chmod(0o755)
+    return project
+
+
+def _make_poetry_project(tmp_path: Path) -> Path:
+    """Create a poetry project scaffold."""
+    project = tmp_path / "poetryproj"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[tool.poetry]\nname = 'poetryproj'\n")
+    (project / "poetry.lock").write_text("")
+    venv = project / ".venv" / "bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text("#!/bin/sh\n")
+    (venv / "python").chmod(0o755)
+    return project
+
+
+def _make_pip_project(tmp_path: Path) -> Path:
+    """Create a pip/venv project scaffold."""
+    project = tmp_path / "pipproj"
+    project.mkdir()
+    (project / "requirements.txt").write_text("requests\n")
     venv = project / ".venv" / "bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text("#!/bin/sh\n")
@@ -38,6 +63,9 @@ def _make_kernel(project: Path, name: str = "testproj") -> Path:
     return kernel_dir
 
 
+# --- help ---
+
+
 def test_help() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -50,19 +78,15 @@ def test_setup_help() -> None:
     assert "Set up Jupyter kernels" in result.output
 
 
+# --- setup (explicit subcommand) ---
+
+
 def test_setup_dry_run(tmp_path: Path) -> None:
     project = _make_project(tmp_path)
     with patch("taco.core._is_package_importable", return_value=True):
         result = runner.invoke(app, ["setup", "--project", str(project), "--dry-run"])
     assert result.exit_code == 0
     assert "Would run" in result.output or "Would patch" in result.output
-
-
-def test_default_command_runs_setup(tmp_path: Path) -> None:
-    """Running `taco` with no subcommand should invoke setup."""
-    result = runner.invoke(app, [])
-    # It will either succeed or fail trying to find a project — either way it invoked setup
-    assert result.exit_code in (0, 1)
 
 
 def test_no_marimo_flag(tmp_path: Path) -> None:
@@ -86,14 +110,69 @@ def test_custom_name_and_display_name(tmp_path: Path) -> None:
     assert "custom" in result.output
 
 
-def test_error_outside_uv_project(tmp_path: Path) -> None:
+def test_error_outside_project(tmp_path: Path) -> None:
     result = runner.invoke(app, ["setup", "--project", str(tmp_path)])
     assert result.exit_code != 0
+
+
+# --- default command (no subcommand = setup) ---
+
+
+def test_default_command_dry_run(tmp_path: Path) -> None:
+    project = _make_project(tmp_path)
+    with patch("taco.core._is_package_importable", return_value=True):
+        result = runner.invoke(app, ["--project", str(project), "--dry-run"])
+    assert result.exit_code == 0
+    assert "Would run" in result.output or "Would patch" in result.output
+
+
+def test_default_command_with_flags(tmp_path: Path) -> None:
+    project = _make_project(tmp_path)
+    with patch("taco.core._is_package_importable", return_value=True):
+        result = runner.invoke(app, [
+            "--project", str(project),
+            "--name", "mykernel",
+            "--no-marimo",
+            "--dry-run",
+        ])
+    assert result.exit_code == 0
+    assert "mykernel" in result.output
+    assert "skipped" in result.output
+
+
+def test_default_command_error_outside_project(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["--project", str(tmp_path)])
+    assert result.exit_code != 0
+
+
+# --- project type detection in CLI ---
+
+
+def test_setup_detects_poetry(tmp_path: Path) -> None:
+    project = _make_poetry_project(tmp_path)
+    with patch("taco.core._is_package_importable", return_value=True):
+        result = runner.invoke(app, ["setup", "--project", str(project), "--dry-run"])
+    assert result.exit_code == 0
+    assert "poetry" in result.output
+
+
+def test_setup_detects_pip(tmp_path: Path) -> None:
+    project = _make_pip_project(tmp_path)
+    with patch("taco.core._is_package_importable", return_value=True):
+        result = runner.invoke(app, ["setup", "--project", str(project), "--dry-run"])
+    assert result.exit_code == 0
+    assert "pip" in result.output
+
+
+# --- list ---
 
 
 def test_list_command() -> None:
     result = runner.invoke(app, ["list"])
     assert result.exit_code == 0
+
+
+# --- info ---
 
 
 def test_info_command(tmp_path: Path) -> None:
@@ -109,6 +188,9 @@ def test_info_missing_kernel(tmp_path: Path) -> None:
     result = runner.invoke(app, ["info", "--project", str(project)])
     assert result.exit_code == 0
     assert "not installed" in result.output
+
+
+# --- remove ---
 
 
 def test_remove_command(tmp_path: Path) -> None:
@@ -132,11 +214,19 @@ def test_remove_dry_run(tmp_path: Path) -> None:
     result = runner.invoke(app, ["remove", "--project", str(project), "--dry-run"])
     assert result.exit_code == 0
     assert "Would remove" in result.output
-    # Kernel should still exist
     kernel_dir = project / ".venv" / "share" / "jupyter" / "kernels" / "testproj"
     assert kernel_dir.exists()
+
+
+# --- clean ---
 
 
 def test_clean_dry_run() -> None:
     result = runner.invoke(app, ["clean", "--dry-run"])
     assert result.exit_code == 0
+
+
+def test_clean_help() -> None:
+    result = runner.invoke(app, ["clean", "--help"])
+    assert result.exit_code == 0
+    assert "stale kernels" in result.output

@@ -49,7 +49,9 @@ def _find_venv(project_root: Path, project_type: ProjectType) -> Path:
     # Check common venv locations
     for name in (".venv", "venv"):
         candidate = project_root / name
-        if (candidate / "bin" / "python").exists() or (candidate / "Scripts" / "python.exe").exists():
+        if (candidate / "bin" / "python").exists() or (
+            candidate / "Scripts" / "python.exe"
+        ).exists():
             return candidate
 
     # For poetry, ask poetry where the venv is
@@ -151,9 +153,7 @@ def _is_package_importable(interpreter: Path, package: str) -> bool:
         return False
 
 
-def compute_missing_deps(
-    interpreter: Path, include_marimo: bool
-) -> list[str]:
+def compute_missing_deps(interpreter: Path, include_marimo: bool) -> list[str]:
     """Return the list of packages that need to be added as dev deps."""
     packages = ["ipykernel"]
     if include_marimo:
@@ -186,9 +186,7 @@ def add_dev_deps(config: TacoConfig, packages: list[str]) -> bool:
     )
     if result.returncode != 0:
         tool = config.project_type.value
-        raise SystemExit(
-            f"[red]Error:[/red] {tool} install failed:\n{result.stderr}"
-        )
+        raise SystemExit(f"[red]Error:[/red] {tool} install failed:\n{result.stderr}")
     return True
 
 
@@ -228,9 +226,7 @@ def install_kernel(config: TacoConfig) -> Path:
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise SystemExit(
-            f"[red]Error:[/red] Kernel install failed:\n{result.stderr}"
-        )
+        raise SystemExit(f"[red]Error:[/red] Kernel install failed:\n{result.stderr}")
     return kernelspec_dir
 
 
@@ -289,13 +285,15 @@ def discover_kernels() -> list[dict]:
             except (json.JSONDecodeError, OSError):
                 continue
             argv = data.get("argv", [])
-            kernels.append({
-                "name": name,
-                "path": str(entry),
-                "display_name": data.get("display_name", name),
-                "interpreter": argv[0] if argv else "unknown",
-                "virtual_env": data.get("env", {}).get("VIRTUAL_ENV", ""),
-            })
+            kernels.append(
+                {
+                    "name": name,
+                    "path": str(entry),
+                    "display_name": data.get("display_name", name),
+                    "interpreter": argv[0] if argv else "unknown",
+                    "virtual_env": data.get("env", {}).get("VIRTUAL_ENV", ""),
+                }
+            )
     return kernels
 
 
@@ -404,7 +402,9 @@ def run_setup(config: TacoConfig) -> None:
     # Step 1: Project detection
     console.print(f"\n[bold]1.[/bold] Project detection [dim]({type_label})[/dim]")
     if config.venv_path.exists() or config.dry_run:
-        console.print(f"   [green]✓[/green] Found {type_label} project at [cyan]{config.project_root}[/cyan]")
+        console.print(
+            f"   [green]✓[/green] Found {type_label} project at [cyan]{config.project_root}[/cyan]"
+        )
     else:
         if config.project_type == ProjectType.PIP:
             console.print(f"   [yellow]![/yellow] No venv found — will create one")
@@ -413,13 +413,17 @@ def run_setup(config: TacoConfig) -> None:
                 # Re-resolve interpreter after creating venv
                 config.interpreter = config.venv_path / "bin" / "python"
         else:
-            console.print(f"   [yellow]![/yellow] No venv found — {type_label} will create one during dependency sync")
+            console.print(
+                f"   [yellow]![/yellow] No venv found — {type_label} will create one during dependency sync"
+            )
 
     # Step 2: Dependency sync
     console.print("\n[bold]2.[/bold] Dependency sync")
     missing = compute_missing_deps(config.interpreter, config.include_marimo)
     if missing:
-        console.print(f"   [yellow]→[/yellow] Adding missing deps: [cyan]{', '.join(missing)}[/cyan]")
+        console.print(
+            f"   [yellow]→[/yellow] Adding missing deps: [cyan]{', '.join(missing)}[/cyan]"
+        )
         add_dev_deps(config, missing)
         console.print(f"   [green]✓[/green] Dependencies synced")
     else:
@@ -435,7 +439,9 @@ def run_setup(config: TacoConfig) -> None:
     # Step 4: Kernelspec patch
     console.print("\n[bold]4.[/bold] Kernelspec patch")
     patch_kernelspec(kernelspec_dir, config)
-    console.print(f"   [green]✓[/green] VIRTUAL_ENV set in [dim]{kernelspec_dir / 'kernel.json'}[/dim]")
+    console.print(
+        f"   [green]✓[/green] VIRTUAL_ENV set in [dim]{kernelspec_dir / 'kernel.json'}[/dim]"
+    )
 
     # Step 5: marimo readiness
     if config.include_marimo:
@@ -448,9 +454,11 @@ def run_setup(config: TacoConfig) -> None:
     next_steps = Text()
     next_steps.append("Next steps\n\n", style="bold green")
     next_steps.append("Cursor:  ", style="bold")
-    next_steps.append(f"Open an .ipynb → select kernel \"{config.display_name}\"\n")
+    next_steps.append(f'Open an .ipynb → select kernel "{config.display_name}"\n')
     next_steps.append("         ", style="bold")
-    next_steps.append("If missing, install the Jupyter extension (ms-toolsai.jupyter)\n\n")
+    next_steps.append(
+        "If missing, install the Jupyter extension (ms-toolsai.jupyter)\n\n"
+    )
     next_steps.append("Jupyter: ", style="bold")
     next_steps.append(f"{_jupyter_launch_hint(config)}\n\n")
     if config.include_marimo:
@@ -492,10 +500,12 @@ def run_info(config: TacoConfig) -> None:
     kernelspec_dir = _get_kernelspec_dir(config)
     data = read_kernel_info(kernelspec_dir)
 
-    console.print(Panel(
-        f"[bold magenta]🌮 Kernel info:[/bold magenta] [cyan]{config.kernel_name}[/cyan]",
-        border_style="magenta",
-    ))
+    console.print(
+        Panel(
+            f"[bold magenta]🌮 Kernel info:[/bold magenta] [cyan]{config.kernel_name}[/cyan]",
+            border_style="magenta",
+        )
+    )
 
     if data is None:
         # Check user-level too
@@ -507,7 +517,9 @@ def run_info(config: TacoConfig) -> None:
                 break
 
     if data is None:
-        console.print(f"\n[yellow]Kernel [cyan]{config.kernel_name}[/cyan] is not installed.[/yellow]")
+        console.print(
+            f"\n[yellow]Kernel [cyan]{config.kernel_name}[/cyan] is not installed.[/yellow]"
+        )
         console.print("Run [bold]taco[/bold] to create it.")
         return
 
@@ -528,7 +540,9 @@ def run_info(config: TacoConfig) -> None:
     if interpreter and interpreter.exists():
         console.print(f"  [green]✓[/green] Interpreter exists")
     else:
-        console.print(f"  [red]✗[/red] Interpreter not found: {argv[0] if argv else 'none'}")
+        console.print(
+            f"  [red]✗[/red] Interpreter not found: {argv[0] if argv else 'none'}"
+        )
 
     venv = env.get("VIRTUAL_ENV")
     if venv and Path(venv).exists():
@@ -550,9 +564,13 @@ def run_remove(config: TacoConfig) -> None:
         removed = remove_kernel(config.kernel_name) or removed
 
     if not removed:
-        console.print(f"[yellow]Kernel [cyan]{config.kernel_name}[/cyan] not found — nothing to remove.[/yellow]")
+        console.print(
+            f"[yellow]Kernel [cyan]{config.kernel_name}[/cyan] not found — nothing to remove.[/yellow]"
+        )
     else:
-        console.print(f"\n[green]Done.[/green] Kernel [cyan]{config.kernel_name}[/cyan] removed.")
+        console.print(
+            f"\n[green]Done.[/green] Kernel [cyan]{config.kernel_name}[/cyan] removed."
+        )
 
 
 def run_clean(dry_run: bool = False) -> None:
@@ -566,12 +584,16 @@ def run_clean(dry_run: bool = False) -> None:
             stale.append(k)
 
     if not stale:
-        console.print("[green]All kernels are healthy — no stale kernels found.[/green]")
+        console.print(
+            "[green]All kernels are healthy — no stale kernels found.[/green]"
+        )
         return
 
     console.print(f"[bold]Found {len(stale)} stale kernel(s):[/bold]\n")
     for k in stale:
-        console.print(f"  [red]✗[/red] [cyan]{k['name']}[/cyan] — interpreter missing: [dim]{k['interpreter']}[/dim]")
+        console.print(
+            f"  [red]✗[/red] [cyan]{k['name']}[/cyan] — interpreter missing: [dim]{k['interpreter']}[/dim]"
+        )
 
     console.print()
     for k in stale:
