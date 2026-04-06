@@ -214,3 +214,5 @@ def run_setup(config: TacoConfig) -> None:
 
     console.print()
     console.print(Panel(next_steps, border_style="green"))
+
+    console.print(f"\n[bold]Kernel name:[/bold] [cyan]{config.kernel_name}[/cyan]")
