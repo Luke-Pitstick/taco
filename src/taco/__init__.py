@@ -1,3 +1,3 @@
-"""taco — uv notebook bootstrapper."""
+"""Taco creates discoverable Jupyter kernels for uv projects."""
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"

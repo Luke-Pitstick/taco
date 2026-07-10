@@ -1,147 +1,260 @@
-"""Core logic for taco — project detection, dependency management, kernel installation."""
+"""Core behavior for Taco's uv-backed Jupyter kernel lifecycle."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
+    import tomli as tomllib
+from jupyter_core.paths import jupyter_data_dir, jupyter_path
 from rich.console import Console
-from rich.panel import Panel
+from rich.markup import escape
 from rich.table import Table
-from rich.text import Text
+
+from taco import __version__
 
 console = Console()
 
+KERNEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+RUNTIME_PROBE = (
+    "import json, sys; "
+    "print(json.dumps({'interpreter': sys.executable, 'environment': sys.prefix}))"
+)
 
-class ProjectType(Enum):
+
+class TacoError(RuntimeError):
+    """An expected operational failure suitable for concise CLI output."""
+
+
+class ProjectType(str, Enum):
+    """The supported project manager."""
+
     UV = "uv"
-    POETRY = "poetry"
-    PIP = "pip"
 
 
 @dataclass
 class TacoConfig:
-    """Resolved configuration for a taco run."""
+    """Resolved configuration for a Taco command."""
 
     project_root: Path
     kernel_name: str
     display_name: str
     project_type: ProjectType = ProjectType.UV
-    include_marimo: bool = True
     dry_run: bool = False
-    venv_path: Path = field(init=False)
-    interpreter: Path = field(init=False)
+    force: bool = False
+    venv_path: Path | None = field(init=False, default=None)
+    interpreter: Path | None = field(init=False, default=None)
+    uv_executable: Path | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
-        self.venv_path = _find_venv(self.project_root, self.project_type)
-        self.interpreter = self.venv_path / "bin" / "python"
+        self.project_root = self.project_root.resolve()
+        validate_kernel_name(self.kernel_name)
 
 
-def _find_venv(project_root: Path, project_type: ProjectType) -> Path:
-    """Locate the virtual environment for the project."""
-    # Check common venv locations
-    for name in (".venv", "venv"):
-        candidate = project_root / name
-        if (candidate / "bin" / "python").exists() or (
-            candidate / "Scripts" / "python.exe"
-        ).exists():
-            return candidate
-
-    # For poetry, ask poetry where the venv is
-    if project_type == ProjectType.POETRY:
-        try:
-            result = subprocess.run(
-                ["poetry", "env", "info", "-p"],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode == 0:
-                venv_path = Path(result.stdout.strip())
-                if venv_path.exists():
-                    return venv_path
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-    # Default to .venv (will be created during dep sync)
-    return project_root / ".venv"
-
-
-def detect_project_type(project_root: Path) -> ProjectType:
-    """Detect what kind of Python project this is."""
-    # Check for uv markers first
-    if (project_root / "uv.lock").exists():
-        return ProjectType.UV
-    pyproject = project_root / "pyproject.toml"
-    if pyproject.exists():
-        content = pyproject.read_text()
-        if "[tool.uv]" in content:
-            return ProjectType.UV
-        # Check for poetry markers
-        if (project_root / "poetry.lock").exists():
-            return ProjectType.POETRY
-        if "[tool.poetry]" in content:
-            return ProjectType.POETRY
-
-    # Check for pip markers
-    if (project_root / "requirements.txt").exists():
-        return ProjectType.PIP
-
-    # If there's a pyproject.toml but no specific markers, check if uv is available
-    if pyproject.exists():
-        try:
-            result = subprocess.run(["uv", "--version"], capture_output=True, timeout=5)
-            if result.returncode == 0:
-                return ProjectType.UV
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        return ProjectType.PIP
-
-    return ProjectType.PIP
-
-
-def find_project_root(start: Path | None = None) -> Path:
-    """Walk up from *start* (default: cwd) to find the nearest project root.
-
-    Looks for pyproject.toml, setup.py, setup.cfg, or requirements.txt.
-    Returns the directory containing it, or raises SystemExit.
-    """
-    markers = ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt")
-    current = (start or Path.cwd()).resolve()
-    for directory in [current, *current.parents]:
-        for marker in markers:
-            if (directory / marker).is_file():
-                return directory
-    raise SystemExit(
-        "[red]Error:[/red] No Python project found. "
-        "Run taco from inside a project with pyproject.toml, setup.py, or requirements.txt."
-    )
+def validate_kernel_name(name: str) -> str:
+    """Validate and return one safe Jupyter kernelspec basename."""
+    if (
+        not name
+        or name in {".", ".."}
+        or not KERNEL_NAME_PATTERN.fullmatch(name)
+        or Path(name).name != name
+    ):
+        raise ValueError("Invalid kernel name. Use only ASCII letters, numbers, '.', '_', or '-'.")
+    return name
 
 
 def sanitize_kernel_name(name: str) -> str:
-    """Sanitize a string into a Jupyter-safe kernel name slug.
-
-    Jupyter kernel names must match [a-zA-Z0-9._-]+.
-    """
-    slug = re.sub(r"[^a-zA-Z0-9._-]", "-", name)
+    """Convert a project name into a safe Jupyter kernelspec basename."""
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", name)
     slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug or "unnamed-kernel"
+    if not slug or slug in {".", ".."}:
+        return "unnamed-kernel"
+    return validate_kernel_name(slug)
 
 
 def default_display_name(project_name: str) -> str:
+    """Return Taco's default user-facing kernel name."""
     return f"Python ({project_name})"
 
 
+def find_project_root(start: Path | None = None, *, explicit: bool = False) -> Path:
+    """Find the nearest uv-compatible project root.
+
+    Explicit paths must already exist and be directories so a typo can never fall
+    back to an unrelated ancestor project.
+    """
+    if start is not None and explicit:
+        if not start.exists():
+            raise ValueError(f"Project directory does not exist: {start}")
+        if not start.is_dir():
+            raise ValueError(f"Project path is not a directory: {start}")
+        current = start.resolve()
+        if (current / "pyproject.toml").is_file() or (current / "uv.lock").is_file():
+            return current
+        raise TacoError(f"No uv project found at the explicit path: {current}")
+
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        if (directory / "pyproject.toml").is_file() or (directory / "uv.lock").is_file():
+            return directory
+    raise TacoError(
+        "No uv project found. Run Taco inside a project with pyproject.toml, "
+        "or pass --project PATH."
+    )
+
+
+def detect_project_type(project_root: Path) -> ProjectType:
+    """Validate that a directory can be managed as a uv project."""
+    if not (project_root / "pyproject.toml").is_file():
+        raise TacoError(
+            f"{project_root} has no pyproject.toml. Taco currently supports uv projects."
+        )
+    return ProjectType.UV
+
+
+def _read_pyproject(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as file:
+            return tomllib.load(file)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def find_uv_workspace_root(project_root: Path) -> Path:
+    """Return the containing uv workspace root, or the project itself."""
+    for directory in (project_root, *project_root.parents):
+        data = _read_pyproject(directory / "pyproject.toml")
+        tool = data.get("tool") if isinstance(data, dict) else None
+        uv = tool.get("uv") if isinstance(tool, dict) else None
+        if isinstance(uv, dict) and isinstance(uv.get("workspace"), dict):
+            return directory
+    return project_root
+
+
+def venv_interpreter(venv_path: Path) -> Path:
+    """Return the platform-correct interpreter for a virtual environment."""
+    candidates = [
+        venv_path / "Scripts" / "python.exe",
+        venv_path / "bin" / "python",
+        venv_path / "bin" / "python3",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0] if os.name == "nt" else candidates[1]
+
+
+def predict_uv_environment(project_root: Path) -> Path:
+    """Predict uv's environment location without creating or syncing it."""
+    workspace_root = find_uv_workspace_root(project_root)
+    configured = os.environ.get("UV_PROJECT_ENVIRONMENT")
+    if configured:
+        path = Path(configured).expanduser()
+        return path.resolve() if path.is_absolute() else (workspace_root / path).resolve()
+    return workspace_root / ".venv"
+
+
+def _executable(name: str, install_hint: str) -> Path:
+    resolved = shutil.which(name)
+    if not resolved:
+        raise TacoError(f"{name} is required. {install_hint}")
+    return Path(resolved).resolve()
+
+
+def _run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: int = 180,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess and translate expected failures into TacoError."""
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise TacoError(f"Command not found: {command[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise TacoError(f"Command timed out: {shlex.join(command)}") from exc
+    except OSError as exc:
+        raise TacoError(f"Could not run {command[0]}: {exc}") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        if len(detail) > 1200:
+            detail = detail[-1200:]
+        message = f"Command failed ({result.returncode}): {shlex.join(command)}"
+        if detail:
+            message = f"{message}\n{detail}"
+        raise TacoError(message)
+    return result
+
+
+def _uv_run_prefix(config: TacoConfig, *, with_ipykernel: bool = False) -> list[str]:
+    uv = config.uv_executable or _executable(
+        "uv", "Install it from https://docs.astral.sh/uv/getting-started/installation/."
+    )
+    config.uv_executable = uv
+    command = [str(uv), "run", "--project", str(config.project_root)]
+    if with_ipykernel:
+        command.extend(["--with", "ipykernel"])
+    return command
+
+
+def resolve_uv_environment(config: TacoConfig) -> None:
+    """Resolve uv's effective interpreter and environment via uv itself."""
+    if config.dry_run:
+        config.uv_executable = Path(shutil.which("uv") or "uv")
+        config.venv_path = predict_uv_environment(config.project_root)
+        config.interpreter = venv_interpreter(config.venv_path)
+        return
+
+    result = _run(
+        [*_uv_run_prefix(config), "python", "-c", RUNTIME_PROBE],
+        cwd=config.project_root,
+    )
+    payload: dict[str, str] | None = None
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(candidate, dict)
+            and {
+                "interpreter",
+                "environment",
+            }
+            <= candidate.keys()
+        ):
+            payload = candidate
+            break
+    if payload is None:
+        raise TacoError("uv did not report its project interpreter.")
+    config.interpreter = Path(payload["interpreter"]).resolve()
+    config.venv_path = Path(payload["environment"]).resolve()
+
+
 def _is_package_importable(interpreter: Path, package: str) -> bool:
-    """Check whether *package* is importable by *interpreter*."""
+    """Return whether a package imports from a concrete interpreter."""
     try:
         result = subprocess.run(
             [str(interpreter), "-c", f"import {package}"],
@@ -149,71 +262,301 @@ def _is_package_importable(interpreter: Path, package: str) -> bool:
             timeout=30,
         )
         return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
 
 
-def compute_missing_deps(interpreter: Path, include_marimo: bool) -> list[str]:
-    """Return the list of packages that need to be added as dev deps."""
+def compute_missing_deps(interpreter: Path, include_marimo: bool = False) -> list[str]:
+    """Compatibility helper returning missing notebook packages."""
     packages = ["ipykernel"]
     if include_marimo:
         packages.append("marimo")
-    return [p for p in packages if not _is_package_importable(interpreter, p)]
+    return [package for package in packages if not _is_package_importable(interpreter, package)]
 
 
 def add_dev_deps(config: TacoConfig, packages: list[str]) -> bool:
-    """Install missing packages using the appropriate package manager."""
+    """Compatibility helper for explicitly adding uv development dependencies."""
     if not packages:
         return False
-
-    if config.project_type == ProjectType.UV:
-        cmd = ["uv", "add", "--dev", "--project", str(config.project_root), *packages]
-    elif config.project_type == ProjectType.POETRY:
-        cmd = ["poetry", "add", "--group", "dev", *packages]
-    else:
-        # pip — install into the venv directly
-        cmd = [str(config.interpreter), "-m", "pip", "install", *packages]
-
+    command = [
+        str(
+            config.uv_executable
+            or _executable(
+                "uv",
+                "Install it from https://docs.astral.sh/uv/getting-started/installation/.",
+            )
+        ),
+        "add",
+        "--dev",
+        "--project",
+        str(config.project_root),
+        *packages,
+    ]
     if config.dry_run:
-        console.print(f"  [dim]Would run:[/dim] {' '.join(cmd)}")
+        console.print(f"PLAN  {shlex.join(command)}", markup=False, soft_wrap=True)
         return True
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=str(config.project_root),
-    )
-    if result.returncode != 0:
-        tool = config.project_type.value
-        raise SystemExit(f"[red]Error:[/red] {tool} install failed:\n{result.stderr}")
+    _run(command, cwd=config.project_root)
     return True
 
 
-def _ensure_venv(config: TacoConfig) -> None:
-    """Create a virtual environment if one doesn't exist (pip projects only)."""
-    if config.venv_path.exists():
-        return
-    if config.project_type != ProjectType.PIP:
-        return
-    if config.dry_run:
-        console.print(f"  [dim]Would run:[/dim] python -m venv {config.venv_path}")
-        return
-    subprocess.run(
-        [sys.executable, "-m", "venv", str(config.venv_path)],
-        check=True,
+def get_user_kernel_dir() -> Path:
+    """Return Jupyter's platform-aware per-user kernels directory."""
+    return Path(jupyter_data_dir()) / "kernels"
+
+
+def get_all_kernel_dirs() -> list[Path]:
+    """Return Jupyter's configured kernelspec search path in precedence order."""
+    directories: list[Path] = []
+    seen: set[str] = set()
+    for value in jupyter_path("kernels"):
+        path = Path(value).expanduser()
+        key = os.path.normcase(str(path.resolve(strict=False)))
+        if key not in seen:
+            directories.append(path)
+            seen.add(key)
+    return directories
+
+
+def _safe_kernel_dir(base: Path, kernel_name: str) -> Path:
+    """Join a validated kernel name and assert it cannot escape its base."""
+    validate_kernel_name(kernel_name)
+    base_resolved = base.resolve(strict=False)
+    target = (base / kernel_name).resolve(strict=False)
+    if target.parent != base_resolved:
+        raise TacoError(f"Unsafe kernelspec path refused: {target}")
+    return target
+
+
+def _get_kernelspec_dir(config: TacoConfig) -> Path:
+    """Return the user-visible kernelspec directory Taco owns for this config."""
+    return _safe_kernel_dir(get_user_kernel_dir(), config.kernel_name)
+
+
+def read_kernel_info(kernelspec_dir: Path) -> dict[str, Any] | None:
+    """Read a kernel.json object, or return None when it is missing or malformed."""
+    kernel_json = kernelspec_dir / "kernel.json"
+    if not kernel_json.is_file():
+        return None
+    try:
+        data = json.loads(kernel_json.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _taco_metadata(data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    taco = metadata.get("taco")
+    if not isinstance(taco, dict):
+        return None
+    if taco.get("schema") != 1 or taco.get("project_type") != ProjectType.UV.value:
+        return None
+    if not isinstance(taco.get("version"), str) or not taco["version"]:
+        return None
+    for key in ("project_root", "environment", "interpreter"):
+        value = taco.get(key)
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            return None
+    return taco
+
+
+def is_taco_managed(data: dict[str, Any] | None) -> bool:
+    """Return whether a kernelspec contains Taco ownership metadata."""
+    return _taco_metadata(data) is not None
+
+
+def discover_kernels(*, managed_only: bool = False) -> list[dict[str, Any]]:
+    """Discover kernels without hiding duplicates or malformed specifications."""
+    kernels: list[dict[str, Any]] = []
+    first_by_name: set[str] = set()
+
+    for kernel_base in get_all_kernel_dirs():
+        if not kernel_base.is_dir():
+            continue
+        try:
+            entries = sorted(kernel_base.iterdir(), key=lambda path: path.name.casefold())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            kernel_json = entry / "kernel.json"
+            if not kernel_json.is_file():
+                continue
+            error = ""
+            try:
+                raw = json.loads(kernel_json.read_text())
+                if not isinstance(raw, dict):
+                    raise ValueError("kernel.json must contain an object")
+                data: dict[str, Any] | None = raw
+            except (json.JSONDecodeError, OSError, ValueError) as exc:
+                data = None
+                error = str(exc)
+
+            taco = _taco_metadata(data)
+            managed = taco is not None
+            if managed_only and not managed:
+                continue
+            argv_value = data.get("argv") if data else None
+            argv = argv_value if isinstance(argv_value, list) else []
+            env_value = data.get("env") if data else None
+            spec_env = env_value if isinstance(env_value, dict) else {}
+            metadata_interpreter = taco.get("interpreter") if taco else None
+            interpreter = (
+                str(metadata_interpreter) if metadata_interpreter else str(argv[0]) if argv else ""
+            )
+            folded = entry.name.casefold()
+            shadowed = folded in first_by_name
+            first_by_name.add(folded)
+            kernels.append(
+                {
+                    "name": entry.name,
+                    "path": str(entry),
+                    "display_name": (
+                        str(data.get("display_name", entry.name)) if data else entry.name
+                    ),
+                    "argv": [str(value) for value in argv],
+                    "launcher": str(argv[0]) if argv else "",
+                    "interpreter": interpreter,
+                    "virtual_env": (
+                        str(taco.get("environment", ""))
+                        if taco
+                        else str(spec_env.get("VIRTUAL_ENV", ""))
+                    ),
+                    "environment": str(taco.get("environment", "")) if taco else "",
+                    "project": str(taco.get("project_root", "")) if taco else "",
+                    "project_type": str(taco.get("project_type", "")) if taco else "",
+                    "managed_by_taco": managed,
+                    "valid": data is not None and bool(argv),
+                    "error": error or ("missing argv" if data is not None and not argv else ""),
+                    "shadowed": shadowed,
+                    "data": data,
+                }
+            )
+    return sorted(kernels, key=lambda item: (item["name"].casefold(), item["path"]))
+
+
+def _same_project(record: dict[str, Any], project_root: Path) -> bool:
+    value = record.get("project")
+    if not value:
+        return False
+    try:
+        return Path(str(value)).resolve() == project_root.resolve()
+    except OSError:
+        return False
+
+
+def _valid_uv_launcher(record: dict[str, Any]) -> bool:
+    """Validate Taco's non-shell uv kernel command shape without executing it."""
+    argv = record.get("argv")
+    project = record.get("project")
+    if not isinstance(argv, list) or not project:
+        return False
+    expected_tail = [
+        "run",
+        "--project",
+        str(project),
+        "--with",
+        "ipykernel",
+        "python",
+        "-m",
+        "ipykernel_launcher",
+        "-f",
+        "{connection_file}",
+    ]
+    return len(argv) == len(expected_tail) + 1 and argv[1:] == expected_tail
+
+
+def _canonical_user_record(record: dict[str, Any]) -> bool:
+    """Return whether a record is an owned spec at Taco's canonical write location."""
+    if not record.get("managed_by_taco"):
+        return False
+    try:
+        expected = _safe_kernel_dir(get_user_kernel_dir(), str(record["name"]))
+        return Path(str(record["path"])).resolve(strict=False) == expected
+    except (KeyError, OSError, TacoError, ValueError):
+        return False
+
+
+def _record_is_stale(record: dict[str, Any]) -> bool:
+    """Return whether a validated Taco record is safe to classify as stale."""
+    return (
+        not record.get("valid")
+        or not bool(record.get("project"))
+        or not Path(str(record["project"])).is_dir()
+        or not _executable_exists(str(record.get("launcher", "")))
+        or not _valid_uv_launcher(record)
     )
 
 
+def _fresh_deletable_record(
+    record: dict[str, Any],
+    *,
+    project_root: Path | None = None,
+    require_stale: bool = False,
+) -> dict[str, Any] | None:
+    """Re-read and revalidate an exact user-level record immediately before deletion."""
+    if not _canonical_user_record(record):
+        return None
+    kernel_dir = Path(str(record["path"]))
+    data = read_kernel_info(kernel_dir)
+    taco = _taco_metadata(data)
+    if taco is None:
+        return None
+    if project_root is not None and Path(taco["project_root"]).resolve() != project_root.resolve():
+        return None
+    refreshed = next(
+        (
+            candidate
+            for candidate in discover_kernels(managed_only=True)
+            if Path(candidate["path"]).resolve(strict=False) == kernel_dir.resolve(strict=False)
+        ),
+        None,
+    )
+    if refreshed is None or not _canonical_user_record(refreshed):
+        return None
+    if require_stale and not _record_is_stale(refreshed):
+        return None
+    return refreshed
+
+
+def _check_kernel_collision(config: TacoConfig) -> None:
+    target = _get_kernelspec_dir(config).resolve(strict=False)
+    for record in discover_kernels():
+        if record["name"].casefold() != config.kernel_name.casefold():
+            continue
+        current = Path(record["path"]).resolve(strict=False)
+        if (
+            current == target
+            and record["managed_by_taco"]
+            and _same_project(record, config.project_root)
+        ):
+            continue
+        if current == target and config.force:
+            continue
+        owner = record.get("project") or "another Jupyter installation"
+        raise TacoError(
+            f"Kernel name '{config.kernel_name}' is already used by {owner}. "
+            "Choose a unique --name, or use --force only to replace the user-level spec."
+        )
+
+
 def install_kernel(config: TacoConfig) -> Path:
-    """Install the ipykernel kernelspec into the project venv and return the kernelspec directory."""
-    cmd = [
-        str(config.interpreter),
+    """Install a user-discoverable kernelspec through uv's ipykernel overlay."""
+    if config.uv_executable is None or config.venv_path is None:
+        resolve_uv_environment(config)
+    _check_kernel_collision(config)
+    command = [
+        *_uv_run_prefix(config, with_ipykernel=True),
+        "python",
         "-m",
         "ipykernel",
         "install",
-        "--prefix",
-        str(config.venv_path),
+        "--user",
         "--name",
         config.kernel_name,
         "--display-name",
@@ -221,388 +564,374 @@ def install_kernel(config: TacoConfig) -> Path:
     ]
     kernelspec_dir = _get_kernelspec_dir(config)
     if config.dry_run:
-        console.print(f"  [dim]Would run:[/dim] {' '.join(cmd)}")
+        console.print(f"PLAN  {shlex.join(command)}", markup=False, soft_wrap=True)
+        console.print(f"PLAN  Write kernelspec to {kernelspec_dir}", markup=False, soft_wrap=True)
         return kernelspec_dir
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise SystemExit(f"[red]Error:[/red] Kernel install failed:\n{result.stderr}")
+    _run(command, cwd=config.project_root)
+    if not (kernelspec_dir / "kernel.json").is_file():
+        raise TacoError(f"ipykernel did not create {kernelspec_dir / 'kernel.json'}")
     return kernelspec_dir
 
 
-def _get_kernelspec_dir(config: TacoConfig) -> Path:
-    """Return the project-local kernelspec directory."""
-    return config.venv_path / "share" / "jupyter" / "kernels" / config.kernel_name
-
-
-def get_all_kernel_dirs() -> list[Path]:
-    """Return all standard kernel search directories for this platform."""
-    dirs: list[Path] = []
-    # User-level
-    if sys.platform == "darwin":
-        dirs.append(Path.home() / "Library" / "Jupyter" / "kernels")
-    else:
-        dirs.append(
-            Path(
-                os.environ.get(
-                    "JUPYTER_DATA_DIR",
-                    Path.home() / ".local" / "share" / "jupyter",
-                )
-            )
-            / "kernels"
+def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:
+    """Make a kernelspec durable, uv-backed, and explicitly Taco-owned."""
+    kernel_json = kernelspec_dir / "kernel.json"
+    if config.dry_run:
+        console.print(
+            f"PLAN  Add Taco ownership metadata to {kernel_json}",
+            markup=False,
+            soft_wrap=True,
         )
-    # System-level
-    if sys.platform == "darwin":
-        dirs.append(Path("/usr/local/share/jupyter/kernels"))
-        dirs.append(Path("/usr/share/jupyter/kernels"))
-    else:
-        dirs.append(Path("/usr/local/share/jupyter/kernels"))
-        dirs.append(Path("/usr/share/jupyter/kernels"))
-    return dirs
+        return
+    data = read_kernel_info(kernelspec_dir)
+    if data is None:
+        raise TacoError(f"Cannot read kernelspec: {kernel_json}")
+    if config.uv_executable is None or config.venv_path is None:
+        raise TacoError("uv environment was not resolved before kernelspec patching.")
+
+    data["argv"] = [
+        str(config.uv_executable),
+        "run",
+        "--project",
+        str(config.project_root),
+        "--with",
+        "ipykernel",
+        "python",
+        "-m",
+        "ipykernel_launcher",
+        "-f",
+        "{connection_file}",
+    ]
+    env_value = data.get("env")
+    spec_env = env_value if isinstance(env_value, dict) else {}
+    spec_env.pop("VIRTUAL_ENV", None)
+    spec_env["UV_PROJECT_ENVIRONMENT"] = str(config.venv_path)
+    data["env"] = spec_env
+    metadata_value = data.get("metadata")
+    metadata = metadata_value if isinstance(metadata_value, dict) else {}
+    metadata["taco"] = {
+        "schema": 1,
+        "version": __version__,
+        "project_root": str(config.project_root),
+        "project_type": config.project_type.value,
+        "environment": str(config.venv_path),
+        "interpreter": str(config.interpreter or ""),
+    }
+    data["metadata"] = metadata
+    temporary = kernel_json.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(data, indent=2) + "\n")
+        temporary.replace(kernel_json)
+    except OSError as exc:
+        raise TacoError(f"Could not update kernelspec {kernel_json}: {exc}") from exc
 
 
-def discover_kernels() -> list[dict]:
-    """Find all installed Jupyter kernels across user and system locations.
+def _executable_exists(command: str) -> bool:
+    if not command:
+        return False
+    path = Path(command).expanduser()
+    if path.is_absolute() or path.parent != Path("."):
+        return path.is_file()
+    return shutil.which(command) is not None
 
-    Returns a list of dicts with keys: name, path, display_name, interpreter, virtual_env.
-    """
-    kernels: list[dict] = []
-    seen_names: set[str] = set()
 
-    for kernel_base in get_all_kernel_dirs():
-        if not kernel_base.is_dir():
-            continue
-        for entry in sorted(kernel_base.iterdir()):
-            kernel_json = entry / "kernel.json"
-            if not kernel_json.is_file():
-                continue
-            name = entry.name
-            if name in seen_names:
-                continue
-            seen_names.add(name)
+def kernel_health(record: dict[str, Any], *, check_runtime: bool = True) -> dict[str, Any]:
+    """Return structured static and runtime checks for one kernelspec."""
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    add("kernelspec", bool(record.get("valid")), record.get("error") or "valid JSON")
+    add(
+        "launcher",
+        _executable_exists(str(record.get("launcher", ""))),
+        str(record.get("launcher") or "missing"),
+    )
+    if record.get("managed_by_taco"):
+        project = Path(str(record.get("project", "")))
+        add("project", project.is_dir(), str(project))
+        environment = Path(str(record.get("environment", "")))
+        add("environment", environment.is_dir(), str(environment))
+        command_valid = _valid_uv_launcher(record)
+        add("command", command_valid, "valid uv launcher" if command_valid else "invalid command")
+        trusted_uv = shutil.which("uv")
+        if check_runtime and project.is_dir() and command_valid and trusted_uv:
+            env = os.environ.copy()
+            if record.get("environment"):
+                env["UV_PROJECT_ENVIRONMENT"] = str(record["environment"])
+            command = [
+                str(Path(trusted_uv).resolve()),
+                "run",
+                "--project",
+                str(project),
+                "--with",
+                "ipykernel",
+                "python",
+                "-c",
+                "import ipykernel",
+            ]
             try:
-                data = json.loads(kernel_json.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-            argv = data.get("argv", [])
-            kernels.append(
-                {
-                    "name": name,
-                    "path": str(entry),
-                    "display_name": data.get("display_name", name),
-                    "interpreter": argv[0] if argv else "unknown",
-                    "virtual_env": data.get("env", {}).get("VIRTUAL_ENV", ""),
-                }
-            )
-    return kernels
+                _run(command, cwd=project, env=env, timeout=180)
+                add("runtime", True, "ipykernel imports through uv")
+            except TacoError as exc:
+                add("runtime", False, str(exc).splitlines()[-1])
+
+    return {"healthy": all(check["ok"] for check in checks), "checks": checks}
 
 
-def remove_kernel(kernel_name: str, dry_run: bool = False) -> bool:
-    """Remove a kernel by name from all known locations. Returns True if anything was removed."""
-    removed = False
-    for kernel_base in get_all_kernel_dirs():
-        kernel_dir = kernel_base / kernel_name
-        if kernel_dir.is_dir():
-            if dry_run:
-                console.print(f"  [dim]Would remove:[/dim] {kernel_dir}")
-            else:
-                shutil.rmtree(kernel_dir)
-                console.print(f"  [green]✓[/green] Removed [cyan]{kernel_dir}[/cyan]")
-            removed = True
-    return removed
+def _find_kernel(config: TacoConfig) -> dict[str, Any] | None:
+    candidates = [
+        record
+        for record in discover_kernels()
+        if record["name"].casefold() == config.kernel_name.casefold()
+    ]
+    for record in candidates:
+        if record["managed_by_taco"] and _same_project(record, config.project_root):
+            return record
+    return None
 
 
 def remove_project_kernel(config: TacoConfig) -> bool:
-    """Remove the project-local kernelspec."""
-    kernelspec_dir = _get_kernelspec_dir(config)
-    if not kernelspec_dir.is_dir():
+    """Remove only the exact Taco-owned spec for this project."""
+    record = _find_kernel(config)
+    if record is None:
         return False
+    record = _fresh_deletable_record(record, project_root=config.project_root)
+    if record is None:
+        return False
+    kernel_dir = Path(record["path"])
+    safe_dir = _safe_kernel_dir(kernel_dir.parent, kernel_dir.name)
     if config.dry_run:
-        console.print(f"  [dim]Would remove:[/dim] {kernelspec_dir}")
+        console.print(f"PLAN  Remove {escape(str(safe_dir))}")
         return True
-    shutil.rmtree(kernelspec_dir)
-    console.print(f"  [green]✓[/green] Removed [cyan]{kernelspec_dir}[/cyan]")
+    try:
+        shutil.rmtree(safe_dir)
+    except OSError as exc:
+        raise TacoError(f"Could not remove kernelspec {safe_dir}: {exc}") from exc
     return True
 
 
-def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:
-    """Patch kernel.json to include VIRTUAL_ENV so out-of-venv frontends work."""
-    kernel_json = kernelspec_dir / "kernel.json"
-    if config.dry_run:
-        console.print(f"  [dim]Would patch:[/dim] {kernel_json}")
-        return
-    if not kernel_json.exists():
-        return
-    data = json.loads(kernel_json.read_text())
-    env = data.get("env", {})
-    env["VIRTUAL_ENV"] = str(config.venv_path)
-    data["env"] = env
-    kernel_json.write_text(json.dumps(data, indent=1) + "\n")
+def remove_kernel(
+    kernel_name: str,
+    dry_run: bool = False,
+    *,
+    project_root: Path | None = None,
+) -> bool:
+    """Remove Taco-owned kernels matching a name and optional project."""
+    validate_kernel_name(kernel_name)
+    removed = False
+    for record in discover_kernels(managed_only=True):
+        if record["name"].casefold() != kernel_name.casefold():
+            continue
+        if project_root is not None and not _same_project(record, project_root):
+            continue
+        record = _fresh_deletable_record(record, project_root=project_root)
+        if record is None:
+            continue
+        kernel_dir = Path(record["path"])
+        safe_dir = _safe_kernel_dir(kernel_dir.parent, kernel_dir.name)
+        if dry_run:
+            console.print(f"PLAN  Remove {escape(str(safe_dir))}")
+        else:
+            try:
+                shutil.rmtree(safe_dir)
+            except OSError as exc:
+                raise TacoError(f"Could not remove kernelspec {safe_dir}: {exc}") from exc
+        removed = True
+    return removed
 
 
-def read_kernel_info(kernelspec_dir: Path) -> dict | None:
-    """Read and return the parsed kernel.json, or None if missing."""
-    kernel_json = kernelspec_dir / "kernel.json"
-    if not kernel_json.is_file():
-        return None
-    try:
-        return json.loads(kernel_json.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
+def _plain_ui() -> bool:
+    return not console.is_terminal or os.environ.get("TERM") == "dumb"
 
 
-def _project_type_label(project_type: ProjectType) -> str:
-    """Human-readable label for the project type."""
-    return {
-        ProjectType.UV: "uv",
-        ProjectType.POETRY: "poetry",
-        ProjectType.PIP: "pip/venv",
-    }[project_type]
-
-
-def _jupyter_launch_hint(config: TacoConfig) -> str:
-    """Return the recommended Jupyter Lab launch command for this project type."""
-    if config.project_type == ProjectType.UV:
-        return "uv run --with jupyter jupyter lab"
-    elif config.project_type == ProjectType.POETRY:
-        return "poetry run jupyter lab"
-    else:
-        return "jupyter lab"
-
-
-def _marimo_launch_hint(config: TacoConfig) -> str:
-    """Return the recommended marimo launch command for this project type."""
-    if config.project_type == ProjectType.UV:
-        return "uv run marimo edit notebook.py"
-    elif config.project_type == ProjectType.POETRY:
-        return "poetry run marimo edit notebook.py"
-    else:
-        return "marimo edit notebook.py"
+def _emit_json(payload: dict[str, Any]) -> None:
+    """Write JSON without Rich highlighting or terminal-dependent ANSI codes."""
+    sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def run_setup(config: TacoConfig) -> None:
-    """Execute the full taco setup workflow with rich output."""
-    project_name = config.project_root.name
-    type_label = _project_type_label(config.project_type)
-
-    # Title panel
-    title = Text()
-    title.append("🌮 taco", style="bold magenta")
-    title.append(" — notebook bootstrapper\n\n")
-    title.append("Project:     ", style="bold")
-    title.append(f"{project_name}\n")
-    title.append("Type:        ", style="bold")
-    title.append(f"{type_label}\n")
-    title.append("Interpreter: ", style="bold")
-    title.append(f"{config.interpreter}\n")
-    title.append("Kernel:      ", style="bold")
-    title.append(f"{config.kernel_name}")
-    console.print(Panel(title, border_style="magenta"))
-
-    # Step 1: Project detection
-    console.print(f"\n[bold]1.[/bold] Project detection [dim]({type_label})[/dim]")
-    if config.venv_path.exists() or config.dry_run:
-        console.print(
-            f"   [green]✓[/green] Found {type_label} project at [cyan]{config.project_root}[/cyan]"
-        )
-    else:
-        if config.project_type == ProjectType.PIP:
-            console.print(f"   [yellow]![/yellow] No venv found — will create one")
-            _ensure_venv(config)
-            if not config.dry_run:
-                # Re-resolve interpreter after creating venv
-                config.interpreter = config.venv_path / "bin" / "python"
-        else:
-            console.print(
-                f"   [yellow]![/yellow] No venv found — {type_label} will create one during dependency sync"
-            )
-
-    # Step 2: Dependency sync
-    console.print("\n[bold]2.[/bold] Dependency sync")
-    missing = compute_missing_deps(config.interpreter, config.include_marimo)
-    if missing:
-        console.print(
-            f"   [yellow]→[/yellow] Adding missing deps: [cyan]{', '.join(missing)}[/cyan]"
-        )
-        add_dev_deps(config, missing)
-        console.print(f"   [green]✓[/green] Dependencies synced")
-    else:
-        console.print("   [green]✓[/green] All notebook dependencies already present")
-
-    # Step 3: Kernel install
-    console.print("\n[bold]3.[/bold] Kernel installation")
-    kernelspec_dir = install_kernel(config)
-    console.print(
-        f"   [green]✓[/green] Kernel [cyan]{config.kernel_name}[/cyan] installed"
-    )
-
-    # Step 4: Kernelspec patch
-    console.print("\n[bold]4.[/bold] Kernelspec patch")
-    patch_kernelspec(kernelspec_dir, config)
-    console.print(
-        f"   [green]✓[/green] VIRTUAL_ENV set in [dim]{kernelspec_dir / 'kernel.json'}[/dim]"
-    )
-
-    # Step 5: marimo readiness
-    if config.include_marimo:
-        console.print("\n[bold]5.[/bold] marimo readiness")
-        console.print("   [green]✓[/green] marimo is available as a dev dependency")
-    else:
-        console.print("\n[bold]5.[/bold] marimo [dim](skipped — --no-marimo)[/dim]")
-
-    # Success panel with next steps
-    next_steps = Text()
-    next_steps.append("Next steps\n\n", style="bold green")
-    next_steps.append("VS Code: ", style="bold")
-    next_steps.append(f'Open an .ipynb → select kernel "{config.display_name}"\n')
-    next_steps.append("         ", style="bold")
-    next_steps.append(
-        "If missing, install the Jupyter extension (ms-toolsai.jupyter)\n\n"
-    )
-    next_steps.append("Jupyter: ", style="bold")
-    next_steps.append(f"{_jupyter_launch_hint(config)}\n\n")
-    if config.include_marimo:
-        next_steps.append("marimo:  ", style="bold")
-        next_steps.append(_marimo_launch_hint(config))
-
+    """Create or refresh and verify a user-discoverable uv kernel."""
+    _check_kernel_collision(config)
+    resolve_uv_environment(config)
+    mode = "DRY RUN" if config.dry_run else "SETUP"
+    console.print(f"{mode}  Taco {__version__}")
+    console.print(f"Project      {escape(str(config.project_root))}")
+    console.print(f"Environment  {escape(str(config.venv_path))}")
+    console.print(f"Kernel       {escape(config.kernel_name)}")
     console.print()
-    console.print(Panel(next_steps, border_style="green"))
 
-    console.print(f"\n[bold]Kernel name:[/bold] [cyan]{config.kernel_name}[/cyan]")
-
-
-def run_list() -> None:
-    """List all installed Jupyter kernels in a table."""
-    kernels = discover_kernels()
-    if not kernels:
-        console.print("[yellow]No Jupyter kernels found.[/yellow]")
+    if config.dry_run:
+        console.print("PLAN  Resolve the effective uv environment")
+        install_kernel(config)
+        patch_kernelspec(_get_kernelspec_dir(config), config)
+        console.print("\nDry run complete — no changes made.")
         return
 
-    table = Table(title="🌮 Installed Jupyter Kernels", border_style="magenta")
-    table.add_column("Name", style="cyan", no_wrap=True)
-    table.add_column("Display Name", style="white")
-    table.add_column("Interpreter", style="dim")
-    table.add_column("VIRTUAL_ENV", style="dim")
+    console.print("OK    Effective uv environment resolved")
+    kernelspec_dir = install_kernel(config)
+    console.print("OK    ipykernel runtime prepared")
+    patch_kernelspec(kernelspec_dir, config)
+    console.print(f"OK    Kernel registered at {escape(str(kernelspec_dir))}")
 
-    for k in kernels:
-        table.add_row(
-            k["name"],
-            k["display_name"],
-            k["interpreter"],
-            k["virtual_env"] or "—",
+    record = _find_kernel(config)
+    if record is None:
+        raise TacoError("The installed kernel is not discoverable through Jupyter.")
+    health = kernel_health(record, check_runtime=True)
+    if not health["healthy"]:
+        failures = ", ".join(check["name"] for check in health["checks"] if not check["ok"])
+        raise TacoError(f"Kernel verification failed: {failures}")
+    console.print("OK    Kernel runtime verified")
+    console.print(f"\nReady  {escape(config.display_name)} is available in Jupyter and VS Code.")
+
+
+def run_list(*, managed_only: bool = True, json_output: bool = False) -> None:
+    """List kernels with deterministic, scriptable output."""
+    kernels = discover_kernels(managed_only=managed_only)
+    records: list[dict[str, Any]] = []
+    for kernel in kernels:
+        health = kernel_health(kernel, check_runtime=False)
+        records.append(
+            {
+                "name": kernel["name"],
+                "display_name": kernel["display_name"],
+                "project": kernel["project"],
+                "environment": kernel["environment"] or kernel["virtual_env"],
+                "interpreter": kernel["interpreter"],
+                "location": kernel["path"],
+                "healthy": health["healthy"],
+                "managed_by_taco": kernel["managed_by_taco"],
+                "shadowed": kernel["shadowed"],
+                "error": kernel["error"],
+            }
         )
-
+    if json_output:
+        _emit_json({"count": len(records), "kernels": records})
+        return
+    if not records:
+        scope = "Taco-managed " if managed_only else ""
+        console.print(f"No {scope}Jupyter kernels found.")
+        return
+    if _plain_ui():
+        for record in records:
+            status = "healthy" if record["healthy"] else "unhealthy"
+            console.print(
+                f"{record['name']}\t{status}\t{record['project'] or record['location']}",
+                markup=False,
+                soft_wrap=True,
+            )
+        return
+    table = Table(title="Taco kernels" if managed_only else "Jupyter kernels")
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Status")
+    table.add_column("Project")
+    table.add_column("Environment", style="dim")
+    for record in records:
+        status = "[green]healthy[/green]" if record["healthy"] else "[red]unhealthy[/red]"
+        table.add_row(
+            escape(record["name"]),
+            status,
+            escape(record["project"] or "—"),
+            escape(record["environment"] or "—"),
+        )
     console.print(table)
 
 
-def run_info(config: TacoConfig) -> None:
-    """Show detailed info about the project's kernel."""
-    kernelspec_dir = _get_kernelspec_dir(config)
-    data = read_kernel_info(kernelspec_dir)
-
-    console.print(
-        Panel(
-            f"[bold magenta]🌮 Kernel info:[/bold magenta] [cyan]{config.kernel_name}[/cyan]",
-            border_style="magenta",
-        )
-    )
-
-    if data is None:
-        # Check user-level too
-        for base in get_all_kernel_dirs():
-            alt = base / config.kernel_name
-            data = read_kernel_info(alt)
-            if data is not None:
-                kernelspec_dir = alt
-                break
-
-    if data is None:
-        console.print(
-            f"\n[yellow]Kernel [cyan]{config.kernel_name}[/cyan] is not installed.[/yellow]"
-        )
-        console.print("Run [bold]taco[/bold] to create it.")
-        return
-
-    argv = data.get("argv", [])
-    env = data.get("env", {})
-
-    console.print(f"\n[bold]Location:[/bold]     {kernelspec_dir}")
-    console.print(f"[bold]Display name:[/bold] {data.get('display_name', '—')}")
-    console.print(f"[bold]Language:[/bold]     {data.get('language', '—')}")
-    console.print(f"[bold]Interpreter:[/bold]  {argv[0] if argv else '—'}")
-    console.print(f"[bold]Command:[/bold]      {' '.join(argv)}")
-    if env.get("VIRTUAL_ENV"):
-        console.print(f"[bold]VIRTUAL_ENV:[/bold]  {env['VIRTUAL_ENV']}")
-
-    # Health checks
-    console.print("\n[bold]Health checks:[/bold]")
-    interpreter = Path(argv[0]) if argv else None
-    if interpreter and interpreter.exists():
-        console.print(f"  [green]✓[/green] Interpreter exists")
-    else:
-        console.print(
-            f"  [red]✗[/red] Interpreter not found: {argv[0] if argv else 'none'}"
-        )
-
-    venv = env.get("VIRTUAL_ENV")
-    if venv and Path(venv).exists():
-        console.print(f"  [green]✓[/green] VIRTUAL_ENV exists")
-    elif venv:
-        console.print(f"  [red]✗[/red] VIRTUAL_ENV path missing: {venv}")
-    else:
-        console.print(f"  [yellow]![/yellow] No VIRTUAL_ENV set")
-
-
-def run_remove(config: TacoConfig) -> None:
-    """Remove the kernel for the current project."""
-    console.print(f"[bold]Removing kernel:[/bold] [cyan]{config.kernel_name}[/cyan]\n")
-
-    removed = remove_project_kernel(config)
-
-    # Also check user-level locations
-    if not config.dry_run:
-        removed = remove_kernel(config.kernel_name) or removed
-
-    if not removed:
-        console.print(
-            f"[yellow]Kernel [cyan]{config.kernel_name}[/cyan] not found — nothing to remove.[/yellow]"
-        )
-    else:
-        console.print(
-            f"\n[green]Done.[/green] Kernel [cyan]{config.kernel_name}[/cyan] removed."
-        )
-
-
-def run_clean(dry_run: bool = False) -> None:
-    """Find and remove kernels whose interpreters no longer exist."""
-    kernels = discover_kernels()
-    stale: list[dict] = []
-
-    for k in kernels:
-        interpreter = Path(k["interpreter"])
-        if not interpreter.exists():
-            stale.append(k)
-
-    if not stale:
-        console.print(
-            "[green]All kernels are healthy — no stale kernels found.[/green]"
-        )
-        return
-
-    console.print(f"[bold]Found {len(stale)} stale kernel(s):[/bold]\n")
-    for k in stale:
-        console.print(
-            f"  [red]✗[/red] [cyan]{k['name']}[/cyan] — interpreter missing: [dim]{k['interpreter']}[/dim]"
-        )
-
-    console.print()
-    for k in stale:
-        kernel_dir = Path(k["path"])
-        if dry_run:
-            console.print(f"  [dim]Would remove:[/dim] {kernel_dir}")
+def run_info(config: TacoConfig, *, json_output: bool = False) -> bool:
+    """Show one project's kernelspec and return whether it is healthy."""
+    record = _find_kernel(config)
+    if record is None:
+        if json_output:
+            _emit_json(
+                {
+                    "name": config.kernel_name,
+                    "found": False,
+                    "healthy": False,
+                    "checks": [],
+                }
+            )
         else:
-            shutil.rmtree(kernel_dir)
-            console.print(f"  [green]✓[/green] Removed [cyan]{k['name']}[/cyan]")
+            console.print(f"Kernel '{escape(config.kernel_name)}' is not installed.")
+            console.print("Run `taco setup` to create it.")
+        return False
 
-    if not dry_run:
-        console.print(f"\n[green]Done.[/green] Removed {len(stale)} stale kernel(s).")
+    health = kernel_health(record, check_runtime=True)
+    payload = {
+        "name": record["name"],
+        "display_name": record["display_name"],
+        "found": True,
+        "healthy": health["healthy"],
+        "project": record["project"],
+        "environment": record["environment"],
+        "interpreter": record["interpreter"],
+        "location": record["path"],
+        "command": record["argv"],
+        "checks": health["checks"],
+    }
+    if json_output:
+        _emit_json(payload)
+        return bool(health["healthy"])
+
+    console.print(f"Kernel       {escape(record['name'])}")
+    console.print(f"Display name {escape(record['display_name'])}")
+    console.print(f"Project      {escape(record['project'])}")
+    console.print(f"Environment  {escape(record['environment'])}")
+    console.print(f"Location     {escape(record['path'])}")
+    console.print("\nHealth checks")
+    for check in health["checks"]:
+        label = "OK" if check["ok"] else "FAIL"
+        console.print(f"{label:<4}  {escape(check['name'])}: {escape(str(check['detail']))}")
+    return bool(health["healthy"])
+
+
+def run_remove(config: TacoConfig) -> bool:
+    """Remove only this project's Taco-owned kernel."""
+    removed = remove_project_kernel(config)
+    if not removed:
+        console.print(f"Kernel '{escape(config.kernel_name)}' is not installed for this project.")
+        return False
+    if config.dry_run:
+        console.print("\nDry run complete — no changes made.")
+    else:
+        console.print(f"Removed kernel '{escape(config.kernel_name)}'.")
+    return True
+
+
+def find_stale_kernels() -> list[dict[str, Any]]:
+    """Return only Taco-owned kernels whose project or launcher is gone."""
+    stale: list[dict[str, Any]] = []
+    for record in discover_kernels(managed_only=True):
+        if not _canonical_user_record(record):
+            continue
+        if _record_is_stale(record):
+            stale.append(record)
+    return stale
+
+
+def run_clean(dry_run: bool = False, *, kernels: list[dict[str, Any]] | None = None) -> int:
+    """Remove stale Taco-owned kernels and return the number found."""
+    stale = list(kernels) if kernels is not None else find_stale_kernels()
+    validated = [
+        refreshed
+        for record in stale
+        if (refreshed := _fresh_deletable_record(record, require_stale=True)) is not None
+    ]
+    if not validated:
+        console.print("No stale Taco kernels found.")
+        return 0
+    for record in validated:
+        action = "PLAN  Remove" if dry_run else "REMOVE"
+        console.print(f"{action}  {escape(record['name'])} ({escape(record['path'])})")
+        if not dry_run:
+            kernel_dir = Path(record["path"])
+            safe_dir = _safe_kernel_dir(kernel_dir.parent, kernel_dir.name)
+            try:
+                shutil.rmtree(safe_dir)
+            except OSError as exc:
+                raise TacoError(f"Could not remove kernelspec {safe_dir}: {exc}") from exc
+    if dry_run:
+        console.print("\nDry run complete — no changes made.")
+    else:
+        console.print(f"\nRemoved {len(validated)} stale Taco kernel(s).")
+    return len(validated)

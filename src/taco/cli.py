@@ -1,172 +1,251 @@
-"""CLI entrypoint for taco."""
+"""Production command-line interface for Taco."""
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional
+from typing import TypeVar
 
 import typer
 
+from taco import __version__
 from taco.core import (
     TacoConfig,
+    TacoError,
     default_display_name,
     detect_project_type,
     find_project_root,
+    find_stale_kernels,
     run_clean,
     run_info,
     run_list,
     run_remove,
     run_setup,
     sanitize_kernel_name,
+    validate_kernel_name,
 )
+
+T = TypeVar("T")
 
 app = typer.Typer(
     name="taco",
-    help="🌮 notebook bootstrapper — register per-project Jupyter kernels in one command.",
-    add_completion=False,
+    help="Create and maintain discoverable Jupyter kernels for uv projects.",
+    add_completion=True,
+    rich_markup_mode="rich",
+    pretty_exceptions_enable=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"taco {__version__}")
+        raise typer.Exit()
+
+
+def _project_callback(value: Path | None) -> Path | None:
+    if value is None:
+        return None
+    if not value.exists():
+        raise typer.BadParameter(f"Project directory does not exist: {value}")
+    if not value.is_dir():
+        raise typer.BadParameter(f"Project path is not a directory: {value}")
+    return value.resolve()
+
+
+def _name_callback(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return validate_kernel_name(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _call(operation: Callable[[], T]) -> T:
+    """Render expected operational failures without a traceback."""
+    try:
+        return operation()
+    except TacoError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except KeyboardInterrupt as exc:
+        typer.echo("Interrupted.", err=True)
+        raise typer.Exit(code=130) from exc
 
 
 def _resolve_config(
     project: Path | None,
     name: str | None,
     display_name: str | None,
-    no_marimo: bool = False,
+    *,
     dry_run: bool = False,
+    force: bool = False,
 ) -> TacoConfig:
-    """Build a TacoConfig from CLI args."""
-    project_root = find_project_root(project)
-    project_name = project_root.name
+    project_root = find_project_root(project, explicit=project is not None)
     project_type = detect_project_type(project_root)
-    kernel_name = name if name else sanitize_kernel_name(project_name)
-    kernel_display = (
-        display_name if display_name else default_display_name(project_name)
-    )
+    kernel_name = name or sanitize_kernel_name(project_root.name)
     return TacoConfig(
         project_root=project_root,
         kernel_name=kernel_name,
-        display_name=kernel_display,
+        display_name=display_name or default_display_name(project_root.name),
         project_type=project_type,
-        include_marimo=not no_marimo,
         dry_run=dry_run,
+        force=force,
     )
-
-
-def _run_setup(
-    project: Path | None = None,
-    name: str | None = None,
-    display_name: str | None = None,
-    no_marimo: bool = False,
-    dry_run: bool = False,
-) -> None:
-    """Shared setup logic used by both the default callback and the setup command."""
-    config = _resolve_config(project, name, display_name, no_marimo, dry_run)
-    run_setup(config)
 
 
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    project: Optional[Path] = typer.Option(
-        None,
-        help="Path to the project root (default: auto-detect).",
-    ),
-    name: Optional[str] = typer.Option(
-        None,
-        help="Kernel name slug (default: project folder name).",
-    ),
-    display_name: Optional[str] = typer.Option(
-        None,
-        "--display-name",
-        help="Kernel display name (default: 'Python (<project>)').",
-    ),
-    no_marimo: bool = typer.Option(
+    version: bool = typer.Option(
         False,
-        "--no-marimo",
-        help="Skip marimo dependency and guidance.",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Show what would happen without making changes.",
+        "--version",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the installed version and exit.",
     ),
 ) -> None:
-    """🌮 notebook bootstrapper."""
+    """Create and maintain discoverable Jupyter kernels for uv projects."""
+    del version
     if ctx.invoked_subcommand is None:
-        _run_setup(project, name, display_name, no_marimo, dry_run)
+        typer.echo(ctx.get_help())
 
 
 @app.command()
 def setup(
-    project: Optional[Path] = typer.Option(
+    project: Path | None = typer.Option(
         None,
-        help="Path to the project root (default: auto-detect).",
+        "--project",
+        "-p",
+        callback=_project_callback,
+        help="uv project or workspace member directory.",
+        metavar="DIRECTORY",
     ),
-    name: Optional[str] = typer.Option(
+    name: str | None = typer.Option(
         None,
-        help="Kernel name slug (default: project folder name).",
+        "--name",
+        "-n",
+        callback=_name_callback,
+        help="Unique kernelspec name (default: project directory name).",
+        metavar="NAME",
     ),
-    display_name: Optional[str] = typer.Option(
+    display_name: str | None = typer.Option(
         None,
         "--display-name",
-        help="Kernel display name (default: 'Python (<project>)').",
+        help="Name shown in notebook kernel pickers.",
+        metavar="TEXT",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview every action without changing files or environments.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Replace a conflicting user-level kernelspec at the same path.",
     ),
     no_marimo: bool = typer.Option(
         False,
         "--no-marimo",
-        help="Skip marimo dependency and guidance.",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Show what would happen without making changes.",
+        hidden=True,
     ),
 ) -> None:
-    """Set up Jupyter kernels for the current project."""
-    _run_setup(project, name, display_name, no_marimo, dry_run)
-
-
-@app.command()
-def remove(
-    project: Optional[Path] = typer.Option(
-        None,
-        help="Path to the project root (default: auto-detect).",
-    ),
-    name: Optional[str] = typer.Option(
-        None,
-        help="Kernel name to remove (default: project folder name).",
-    ),
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Show what would be removed without deleting.",
-    ),
-) -> None:
-    """Remove the Jupyter kernel for a project."""
-    config = _resolve_config(project, name, None, dry_run=dry_run)
-    run_remove(config)
+    """Create or refresh a project kernel and verify its runtime."""
+    del no_marimo  # Compatibility with Taco 0.2; marimo is no longer installed.
+    _call(
+        lambda: run_setup(
+            _resolve_config(
+                project,
+                name,
+                display_name,
+                dry_run=dry_run,
+                force=force,
+            )
+        )
+    )
 
 
 @app.command(name="list")
-def list_kernels() -> None:
-    """List all installed Jupyter kernels."""
-    run_list()
+def list_kernels(
+    all_kernels: bool = typer.Option(
+        False,
+        "--all",
+        help="Include kernels not managed by Taco.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit one machine-readable JSON document.",
+    ),
+) -> None:
+    """List Taco kernels and their static health status."""
+    _call(lambda: run_list(managed_only=not all_kernels, json_output=json_output))
 
 
 @app.command()
 def info(
-    project: Optional[Path] = typer.Option(
+    project: Path | None = typer.Option(
         None,
-        help="Path to the project root (default: auto-detect).",
+        "--project",
+        "-p",
+        callback=_project_callback,
+        help="uv project or workspace member directory.",
+        metavar="DIRECTORY",
     ),
-    name: Optional[str] = typer.Option(
+    name: str | None = typer.Option(
         None,
-        help="Kernel name to inspect (default: project folder name).",
+        "--name",
+        "-n",
+        callback=_name_callback,
+        help="Kernel name (default: project directory name).",
+        metavar="NAME",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit one machine-readable JSON document.",
     ),
 ) -> None:
-    """Show detailed info and health checks for a project's kernel."""
-    config = _resolve_config(project, name, None)
-    run_info(config)
+    """Run discovery, path, environment, and runtime health checks."""
+    healthy = _call(
+        lambda: run_info(
+            _resolve_config(project, name, None),
+            json_output=json_output,
+        )
+    )
+    if not healthy:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def remove(
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        callback=_project_callback,
+        help="uv project or workspace member directory.",
+        metavar="DIRECTORY",
+    ),
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        "-n",
+        callback=_name_callback,
+        help="Kernel name (default: project directory name).",
+        metavar="NAME",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview the exact Taco-owned kernelspec without deleting it.",
+    ),
+) -> None:
+    """Remove only this project's Taco-owned kernelspec."""
+    _call(lambda: run_remove(_resolve_config(project, name, None, dry_run=dry_run)))
 
 
 @app.command()
@@ -174,8 +253,40 @@ def clean(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Show stale kernels without removing them.",
+        help="List stale Taco kernels without deleting them.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Remove stale Taco kernels without prompting.",
     ),
 ) -> None:
-    """Find and remove stale kernels whose interpreters no longer exist."""
-    run_clean(dry_run)
+    """Remove Taco kernels whose project or uv launcher no longer exists."""
+    stale = _call(find_stale_kernels)
+    if not stale or dry_run:
+        _call(lambda: run_clean(dry_run=dry_run, kernels=stale))
+        return
+    if not yes:
+        typer.echo(f"Found {len(stale)} stale Taco kernel(s):")
+        for record in stale:
+            typer.echo(f"  {record['name']}  {record['path']}")
+        if not sys.stdin.isatty():
+            typer.echo(
+                f"Error: {len(stale)} stale Taco kernel(s) found; rerun with --yes or --dry-run.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if not typer.confirm(f"Remove {len(stale)} stale Taco kernel(s)?", default=False):
+            typer.echo("Cancelled — no changes made.")
+            return
+    _call(lambda: run_clean(kernels=stale))
+
+
+def cli() -> None:
+    """Console-script wrapper used by python -m taco and packaging entry points."""
+    app()
+
+
+if __name__ == "__main__":
+    cli()

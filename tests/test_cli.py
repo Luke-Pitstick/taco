@@ -1,4 +1,4 @@
-"""CLI tests for taco — flag handling, subcommands, dry-run, error paths."""
+"""CLI contract tests for safe, scriptable production behavior."""
 
 from __future__ import annotations
 
@@ -6,227 +6,213 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from typer.testing import CliRunner
 
+from taco import __version__
 from taco.cli import app
 
 runner = CliRunner()
 
 
 def _make_project(tmp_path: Path, name: str = "testproj") -> Path:
-    """Create a minimal project scaffold in a fixed-name subdirectory."""
     project = tmp_path / name
     project.mkdir()
-    (project / "pyproject.toml").write_text(f"[project]\nname = '{name}'\n")
-    venv = project / ".venv" / "bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text("#!/bin/sh\n")
-    (venv / "python").chmod(0o755)
+    (project / "pyproject.toml").write_text(f"[project]\nname = {name!r}\nversion = '0.1.0'\n")
     return project
 
 
-def _make_poetry_project(tmp_path: Path) -> Path:
-    """Create a poetry project scaffold."""
-    project = tmp_path / "poetryproj"
-    project.mkdir()
-    (project / "pyproject.toml").write_text("[tool.poetry]\nname = 'poetryproj'\n")
-    (project / "poetry.lock").write_text("")
-    venv = project / ".venv" / "bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text("#!/bin/sh\n")
-    (venv / "python").chmod(0o755)
-    return project
-
-
-def _make_pip_project(tmp_path: Path) -> Path:
-    """Create a pip/venv project scaffold."""
-    project = tmp_path / "pipproj"
-    project.mkdir()
-    (project / "requirements.txt").write_text("requests\n")
-    venv = project / ".venv" / "bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text("#!/bin/sh\n")
-    (venv / "python").chmod(0o755)
-    return project
-
-
-def _make_kernel(project: Path, name: str = "testproj") -> Path:
-    """Create a fake kernelspec directory inside the project venv."""
-    kernel_dir = project / ".venv" / "share" / "jupyter" / "kernels" / name
+def _make_managed_kernel(data_dir: Path, project: Path, name: str = "testproj") -> Path:
+    kernel_dir = data_dir / "kernels" / name
     kernel_dir.mkdir(parents=True)
-    (kernel_dir / "kernel.json").write_text(json.dumps({
-        "argv": [str(project / ".venv" / "bin" / "python"), "-m", "ipykernel_launcher", "-f", "{connection_file}"],
-        "display_name": f"Python ({name})",
-        "language": "python",
-        "env": {"VIRTUAL_ENV": str(project / ".venv")},
-    }))
+    environment = project / ".venv"
+    (kernel_dir / "kernel.json").write_text(
+        json.dumps(
+            {
+                "argv": ["/usr/local/bin/uv", "run", "--project", str(project)],
+                "display_name": f"Python ({name})",
+                "language": "python",
+                "metadata": {
+                    "taco": {
+                        "schema": 1,
+                        "version": __version__,
+                        "project_root": str(project),
+                        "project_type": "uv",
+                        "environment": str(environment),
+                        "interpreter": str(environment / "bin" / "python"),
+                    }
+                },
+            }
+        )
+    )
     return kernel_dir
 
 
-# --- help ---
+def test_root_help_and_short_help() -> None:
+    for arguments in (["--help"], ["-h"], []):
+        result = runner.invoke(app, arguments)
+        assert result.exit_code == 0
+        assert "Create and maintain discoverable Jupyter kernels" in result.output
+        assert "setup" in result.output
 
 
-def test_help() -> None:
-    result = runner.invoke(app, ["--help"])
+@pytest.mark.parametrize("command", ["setup", "list", "info", "remove", "clean"])
+def test_short_help_for_every_command(command: str) -> None:
+    result = runner.invoke(app, [command, "-h"])
     assert result.exit_code == 0
-    assert "notebook bootstrapper" in result.output
+    assert f"Usage: taco {command}" in result.output
 
 
-def test_setup_help() -> None:
-    result = runner.invoke(app, ["setup", "--help"])
+def test_version_is_eager() -> None:
+    result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert "Set up Jupyter kernels" in result.output
+    assert result.output == f"taco {__version__}\n"
 
 
-# --- setup (explicit subcommand) ---
-
-
-def test_setup_dry_run(tmp_path: Path) -> None:
+def test_setup_dry_run_has_no_writes_or_false_success(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, ["setup", "--project", str(project), "--dry-run"])
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    before = sorted(path.relative_to(project) for path in project.rglob("*"))
+
+    result = runner.invoke(
+        app,
+        ["setup", "--project", str(project), "--dry-run"],
+    )
+
+    after = sorted(path.relative_to(project) for path in project.rglob("*"))
     assert result.exit_code == 0
-    assert "Would run" in result.output or "Would patch" in result.output
+    assert "PLAN" in result.output
+    assert "Dry run complete — no changes made." in result.output
+    assert "Kernel registered" not in result.output
+    assert before == after
+    assert not data_dir.exists()
 
 
-def test_no_marimo_flag(tmp_path: Path) -> None:
+def test_setup_renders_brackets_in_display_name_literally(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, ["setup", "--project", str(project), "--no-marimo", "--dry-run"])
-    assert result.exit_code == 0
-    assert "skipped" in result.output
-
-
-def test_custom_name_and_display_name(tmp_path: Path) -> None:
-    project = _make_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, [
-            "setup", "--project", str(project),
-            "--name", "custom",
-            "--display-name", "My Custom Kernel",
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+    result = runner.invoke(
+        app,
+        [
+            "setup",
+            "--project",
+            str(project),
+            "--display-name",
+            "Python [forecast]",
             "--dry-run",
-        ])
+        ],
+    )
     assert result.exit_code == 0
-    assert "custom" in result.output
+    assert "Traceback" not in result.output
 
 
-def test_error_outside_project(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["setup", "--project", str(tmp_path)])
-    assert result.exit_code != 0
-
-
-# --- default command (no subcommand = setup) ---
-
-
-def test_default_command_dry_run(tmp_path: Path) -> None:
+def test_legacy_no_marimo_flag_remains_a_noop(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, ["--project", str(project), "--dry-run"])
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+    result = runner.invoke(
+        app,
+        ["setup", "--project", str(project), "--no-marimo", "--dry-run"],
+    )
     assert result.exit_code == 0
-    assert "Would run" in result.output or "Would patch" in result.output
+    assert "--with marimo" not in result.output
 
 
-def test_default_command_with_flags(tmp_path: Path) -> None:
+def test_runtime_error_is_concise_without_traceback(tmp_path: Path) -> None:
     project = _make_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, [
-            "--project", str(project),
-            "--name", "mykernel",
-            "--no-marimo",
-            "--dry-run",
-        ])
+    with patch("taco.core.shutil.which", return_value=None):
+        result = runner.invoke(app, ["setup", "--project", str(project)])
+    assert result.exit_code == 1
+    assert "uv is required" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_list_json_is_one_document(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+    result = runner.invoke(app, ["list", "--json"])
     assert result.exit_code == 0
-    assert "mykernel" in result.output
-    assert "skipped" in result.output
+    payload = json.loads(result.stdout)
+    assert payload == {"count": 0, "kernels": []}
 
 
-def test_default_command_error_outside_project(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["--project", str(tmp_path)])
-    assert result.exit_code != 0
-
-
-# --- project type detection in CLI ---
-
-
-def test_setup_detects_poetry(tmp_path: Path) -> None:
-    project = _make_poetry_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, ["setup", "--project", str(project), "--dry-run"])
-    assert result.exit_code == 0
-    assert "poetry" in result.output
-
-
-def test_setup_detects_pip(tmp_path: Path) -> None:
-    project = _make_pip_project(tmp_path)
-    with patch("taco.core._is_package_importable", return_value=True):
-        result = runner.invoke(app, ["setup", "--project", str(project), "--dry-run"])
-    assert result.exit_code == 0
-    assert "pip" in result.output
-
-
-# --- list ---
-
-
-def test_list_command() -> None:
-    result = runner.invoke(app, ["list"])
-    assert result.exit_code == 0
-
-
-# --- info ---
-
-
-def test_info_command(tmp_path: Path) -> None:
+def test_info_missing_kernel_is_exit_one(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    _make_kernel(project)
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
     result = runner.invoke(app, ["info", "--project", str(project)])
-    assert result.exit_code == 0
-    assert "testproj" in result.output
+    assert result.exit_code == 1
+    assert "not installed" in result.output
 
 
-def test_info_missing_kernel(tmp_path: Path) -> None:
+def test_info_healthy_kernel_is_exit_zero(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    result = runner.invoke(app, ["info", "--project", str(project)])
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    _make_managed_kernel(data_dir, project)
+    health = {
+        "healthy": True,
+        "checks": [{"name": "runtime", "ok": True, "detail": "ready"}],
+    }
+    with patch("taco.core.kernel_health", return_value=health):
+        result = runner.invoke(app, ["info", "--project", str(project)])
+    assert result.exit_code == 0
+    assert "runtime: ready" in result.output
+
+
+def test_info_unhealthy_kernel_is_exit_one(tmp_path: Path, monkeypatch) -> None:
+    project = _make_project(tmp_path)
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    _make_managed_kernel(data_dir, project)
+    health = {
+        "healthy": False,
+        "checks": [{"name": "runtime", "ok": False, "detail": "ipykernel missing"}],
+    }
+    with patch("taco.core.kernel_health", return_value=health):
+        result = runner.invoke(app, ["info", "--project", str(project)])
+    assert result.exit_code == 1
+    assert "FAIL" in result.output
+
+
+def test_remove_exact_managed_kernel(tmp_path: Path, monkeypatch) -> None:
+    project = _make_project(tmp_path)
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    kernel_dir = _make_managed_kernel(data_dir, project)
+
+    result = runner.invoke(app, ["remove", "--project", str(project)])
+
+    assert result.exit_code == 0
+    assert "Removed kernel" in result.output
+    assert not kernel_dir.exists()
+
+
+def test_remove_missing_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    project = _make_project(tmp_path)
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+    result = runner.invoke(app, ["remove", "--project", str(project)])
     assert result.exit_code == 0
     assert "not installed" in result.output
 
 
-# --- remove ---
-
-
-def test_remove_command(tmp_path: Path) -> None:
+def test_remove_dry_run_previews_and_preserves_kernel(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    _make_kernel(project)
-    result = runner.invoke(app, ["remove", "--project", str(project)])
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    kernel_dir = _make_managed_kernel(data_dir, project)
+
+    result = runner.invoke(
+        app,
+        ["remove", "--project", str(project), "--dry-run"],
+    )
+
     assert result.exit_code == 0
-    assert "Removed" in result.output
+    assert "PLAN  Remove" in result.output
+    assert "no changes made" in result.output
+    assert kernel_dir.is_dir()
 
 
-def test_remove_missing_kernel(tmp_path: Path) -> None:
-    project = _make_project(tmp_path)
-    result = runner.invoke(app, ["remove", "--project", str(project)])
+def test_clean_noop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
+    result = runner.invoke(app, ["clean"])
     assert result.exit_code == 0
-    assert "not found" in result.output
-
-
-def test_remove_dry_run(tmp_path: Path) -> None:
-    project = _make_project(tmp_path)
-    _make_kernel(project)
-    result = runner.invoke(app, ["remove", "--project", str(project), "--dry-run"])
-    assert result.exit_code == 0
-    assert "Would remove" in result.output
-    kernel_dir = project / ".venv" / "share" / "jupyter" / "kernels" / "testproj"
-    assert kernel_dir.exists()
-
-
-# --- clean ---
-
-
-def test_clean_dry_run() -> None:
-    result = runner.invoke(app, ["clean", "--dry-run"])
-    assert result.exit_code == 0
-
-
-def test_clean_help() -> None:
-    result = runner.invoke(app, ["clean", "--help"])
-    assert result.exit_code == 0
-    assert "stale kernels" in result.output
+    assert "No stale Taco kernels" in result.output
