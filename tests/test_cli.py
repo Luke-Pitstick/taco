@@ -120,6 +120,8 @@ def test_legacy_no_marimo_flag_remains_a_noop(tmp_path: Path, monkeypatch) -> No
 
 def test_runtime_error_is_concise_without_traceback(tmp_path: Path) -> None:
     project = _make_project(tmp_path)
+    with (project / "pyproject.toml").open("a") as file:
+        file.write("\n[tool.uv]\n")
     with patch("taco.core.shutil.which", return_value=None):
         result = runner.invoke(app, ["setup", "--project", str(project)])
     assert result.exit_code == 1

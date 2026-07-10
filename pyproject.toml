@@ -1,13 +1,13 @@
 [project]
 name = "taco"
 version = "0.3.0"
-description = "Create discoverable, durable Jupyter kernels for uv projects"
+description = "Create discoverable, durable Jupyter kernels for Python environments"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
     { name = "Luke Pitstick" },
 ]
-keywords = ["jupyter", "kernel", "notebook", "uv"]
+keywords = ["jupyter", "kernel", "notebook", "uv", "poetry", "conda"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -50,7 +50,7 @@ dev = [
 
 [tool.pytest.ini_options]
 markers = [
-    "integration: full end-to-end tests requiring uv and a real project",
+    "integration: full end-to-end tests requiring real environments and live kernels",
 ]
 
 [tool.ruff]

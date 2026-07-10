@@ -30,7 +30,7 @@ T = TypeVar("T")
 
 app = typer.Typer(
     name="taco",
-    help="Create and maintain discoverable Jupyter kernels for uv projects.",
+    help="Create and maintain discoverable Jupyter kernels for Python environments.",
     add_completion=True,
     rich_markup_mode="rich",
     pretty_exceptions_enable=False,
@@ -107,7 +107,7 @@ def main(
         help="Show the installed version and exit.",
     ),
 ) -> None:
-    """Create and maintain discoverable Jupyter kernels for uv projects."""
+    """Create and maintain discoverable Jupyter kernels for Python environments."""
     del version
     if ctx.invoked_subcommand is None:
         typer.echo(ctx.get_help())
@@ -120,7 +120,7 @@ def setup(
         "--project",
         "-p",
         callback=_project_callback,
-        help="uv project or workspace member directory.",
+        help="Python project or working directory.",
         metavar="DIRECTORY",
     ),
     name: str | None = typer.Option(
@@ -192,7 +192,7 @@ def info(
         "--project",
         "-p",
         callback=_project_callback,
-        help="uv project or workspace member directory.",
+        help="Python project or working directory.",
         metavar="DIRECTORY",
     ),
     name: str | None = typer.Option(
@@ -227,7 +227,7 @@ def remove(
         "--project",
         "-p",
         callback=_project_callback,
-        help="uv project or workspace member directory.",
+        help="Python project or working directory.",
         metavar="DIRECTORY",
     ),
     name: str | None = typer.Option(
@@ -262,7 +262,7 @@ def clean(
         help="Remove stale Taco kernels without prompting.",
     ),
 ) -> None:
-    """Remove Taco kernels whose project or uv launcher no longer exists."""
+    """Remove Taco kernels whose project or interpreter no longer exists."""
     stale = _call(find_stale_kernels)
     if not stale or dry_run:
         _call(lambda: run_clean(dry_run=dry_run, kernels=stale))

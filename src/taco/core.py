@@ -1,4 +1,4 @@
-"""Core behavior for Taco's uv-backed Jupyter kernel lifecycle."""
+"""Core behavior for Taco's environment-backed Jupyter kernel lifecycle."""
 
 from __future__ import annotations
 
@@ -39,9 +39,13 @@ class TacoError(RuntimeError):
 
 
 class ProjectType(str, Enum):
-    """The supported project manager."""
+    """The environment strategy used to launch a project kernel."""
 
     UV = "uv"
+    POETRY = "poetry"
+    CONDA = "conda"
+    VENV = "venv"
+    PYTHON = "python"
 
 
 @dataclass
@@ -90,7 +94,7 @@ def default_display_name(project_name: str) -> str:
 
 
 def find_project_root(start: Path | None = None, *, explicit: bool = False) -> Path:
-    """Find the nearest uv-compatible project root.
+    """Find the nearest Python project root, falling back to the working directory.
 
     Explicit paths must already exist and be directories so a typo can never fall
     back to an unrelated ancestor project.
@@ -100,28 +104,56 @@ def find_project_root(start: Path | None = None, *, explicit: bool = False) -> P
             raise ValueError(f"Project directory does not exist: {start}")
         if not start.is_dir():
             raise ValueError(f"Project path is not a directory: {start}")
-        current = start.resolve()
-        if (current / "pyproject.toml").is_file() or (current / "uv.lock").is_file():
-            return current
-        raise TacoError(f"No uv project found at the explicit path: {current}")
+        return start.resolve()
 
     current = (start or Path.cwd()).resolve()
     for directory in (current, *current.parents):
-        if (directory / "pyproject.toml").is_file() or (directory / "uv.lock").is_file():
+        markers = (
+            "pyproject.toml",
+            "uv.lock",
+            "poetry.lock",
+            "requirements.txt",
+            "environment.yml",
+            "environment.yaml",
+        )
+        if (
+            any((directory / marker).is_file() for marker in markers)
+            or (directory / ".venv").is_dir()
+        ):
             return directory
-    raise TacoError(
-        "No uv project found. Run Taco inside a project with pyproject.toml, "
-        "or pass --project PATH."
-    )
+    return current
 
 
 def detect_project_type(project_root: Path) -> ProjectType:
-    """Validate that a directory can be managed as a uv project."""
-    if not (project_root / "pyproject.toml").is_file():
-        raise TacoError(
-            f"{project_root} has no pyproject.toml. Taco currently supports uv projects."
+    """Choose a manager-specific or generic interpreter resolution strategy."""
+    data = _read_pyproject(project_root / "pyproject.toml")
+    tool = data.get("tool") if isinstance(data, dict) else None
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+
+    if (
+        (project_root / "uv.lock").is_file()
+        or isinstance(uv, dict)
+        or (
+            (project_root / "pyproject.toml").is_file()
+            and bool(os.environ.get("UV_PROJECT_ENVIRONMENT"))
         )
-    return ProjectType.UV
+    ):
+        return ProjectType.UV
+    if find_uv_workspace_root(project_root) != project_root:
+        return ProjectType.UV
+    if (project_root / "poetry.lock").is_file() or isinstance(poetry, dict):
+        return ProjectType.POETRY
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix and venv_interpreter(Path(conda_prefix)).is_file():
+        return ProjectType.CONDA
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env and venv_interpreter(Path(virtual_env)).is_file():
+        return ProjectType.VENV
+    if venv_interpreter(project_root / ".venv").is_file():
+        return ProjectType.VENV
+    return ProjectType.PYTHON
 
 
 def _read_pyproject(path: Path) -> dict[str, Any]:
@@ -146,6 +178,7 @@ def find_uv_workspace_root(project_root: Path) -> Path:
 def venv_interpreter(venv_path: Path) -> Path:
     """Return the platform-correct interpreter for a virtual environment."""
     candidates = [
+        venv_path / "python.exe",
         venv_path / "Scripts" / "python.exe",
         venv_path / "bin" / "python",
         venv_path / "bin" / "python3",
@@ -153,7 +186,7 @@ def venv_interpreter(venv_path: Path) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    return candidates[0] if os.name == "nt" else candidates[1]
+    return candidates[1] if os.name == "nt" else candidates[2]
 
 
 def predict_uv_environment(project_root: Path) -> Path:
@@ -164,6 +197,29 @@ def predict_uv_environment(project_root: Path) -> Path:
         path = Path(configured).expanduser()
         return path.resolve() if path.is_absolute() else (workspace_root / path).resolve()
     return workspace_root / ".venv"
+
+
+def _direct_interpreter(config: TacoConfig) -> Path:
+    """Return the best concrete interpreter for a non-manager environment."""
+    if config.project_type is ProjectType.CONDA:
+        prefix = os.environ.get("CONDA_PREFIX")
+        if prefix:
+            return venv_interpreter(Path(prefix))
+    if config.project_type is ProjectType.VENV:
+        prefix = os.environ.get("VIRTUAL_ENV")
+        if prefix and venv_interpreter(Path(prefix)).is_file():
+            return venv_interpreter(Path(prefix))
+        return venv_interpreter(config.project_root / ".venv")
+
+    resolved = shutil.which("python") or shutil.which("python3")
+    return Path(resolved).resolve() if resolved else Path(sys.executable).resolve()
+
+
+def _predicted_environment(interpreter: Path) -> Path:
+    """Predict sys.prefix from a conventional interpreter path for dry runs."""
+    if interpreter.parent.name in {"bin", "Scripts"}:
+        return interpreter.parent.parent
+    return interpreter.parent
 
 
 def _executable(name: str, install_hint: str) -> Path:
@@ -219,7 +275,29 @@ def _uv_run_prefix(config: TacoConfig, *, with_ipykernel: bool = False) -> list[
     return command
 
 
-def resolve_uv_environment(config: TacoConfig) -> None:
+def _runtime_payload(result: subprocess.CompletedProcess[str], source: str) -> dict[str, str]:
+    """Extract the final JSON runtime probe emitted by an environment command."""
+    for line in reversed(result.stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(candidate, dict)
+            and {"interpreter", "environment"} <= candidate.keys()
+            and isinstance(candidate["interpreter"], str)
+            and isinstance(candidate["environment"], str)
+        ):
+            return candidate
+    raise TacoError(f"{source} did not report its project interpreter.")
+
+
+def _absolute_path(value: str) -> Path:
+    """Make a reported path absolute without collapsing environment symlinks."""
+    return Path(os.path.abspath(os.path.expanduser(value)))
+
+
+def _resolve_uv_environment(config: TacoConfig) -> None:
     """Resolve uv's effective interpreter and environment via uv itself."""
     if config.dry_run:
         config.uv_executable = Path(shutil.which("uv") or "uv")
@@ -231,26 +309,51 @@ def resolve_uv_environment(config: TacoConfig) -> None:
         [*_uv_run_prefix(config), "python", "-c", RUNTIME_PROBE],
         cwd=config.project_root,
     )
-    payload: dict[str, str] | None = None
-    for line in reversed(result.stdout.splitlines()):
-        try:
-            candidate = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if (
-            isinstance(candidate, dict)
-            and {
-                "interpreter",
-                "environment",
-            }
-            <= candidate.keys()
-        ):
-            payload = candidate
-            break
-    if payload is None:
-        raise TacoError("uv did not report its project interpreter.")
-    config.interpreter = Path(payload["interpreter"]).resolve()
+    payload = _runtime_payload(result, "uv")
+    config.interpreter = _absolute_path(payload["interpreter"])
     config.venv_path = Path(payload["environment"]).resolve()
+
+
+def resolve_environment(config: TacoConfig) -> None:
+    """Resolve the effective interpreter and environment for any supported strategy."""
+    if config.project_type is ProjectType.UV:
+        _resolve_uv_environment(config)
+        return
+
+    if config.project_type is ProjectType.POETRY:
+        poetry = Path(shutil.which("poetry") or "poetry")
+        if config.dry_run:
+            active = os.environ.get("VIRTUAL_ENV")
+            config.venv_path = Path(active).resolve() if active else config.project_root / ".venv"
+            config.interpreter = venv_interpreter(config.venv_path)
+            return
+        poetry = _executable(
+            "poetry", "Install it from https://python-poetry.org/docs/#installation."
+        )
+        result = _run(
+            [str(poetry), "run", "python", "-c", RUNTIME_PROBE],
+            cwd=config.project_root,
+        )
+        payload = _runtime_payload(result, "Poetry")
+    else:
+        interpreter = _direct_interpreter(config)
+        if config.dry_run:
+            config.interpreter = interpreter
+            prefix = os.environ.get("CONDA_PREFIX") or os.environ.get("VIRTUAL_ENV")
+            config.venv_path = (
+                Path(prefix).resolve() if prefix else _predicted_environment(interpreter)
+            )
+            return
+        result = _run([str(interpreter), "-c", RUNTIME_PROBE], cwd=config.project_root)
+        payload = _runtime_payload(result, "Python")
+
+    config.interpreter = _absolute_path(payload["interpreter"])
+    config.venv_path = Path(payload["environment"]).resolve()
+
+
+def resolve_uv_environment(config: TacoConfig) -> None:
+    """Compatibility wrapper for callers that explicitly resolve uv projects."""
+    _resolve_uv_environment(config)
 
 
 def _is_package_importable(interpreter: Path, package: str) -> bool:
@@ -353,7 +456,9 @@ def _taco_metadata(data: dict[str, Any] | None) -> dict[str, Any] | None:
     taco = metadata.get("taco")
     if not isinstance(taco, dict):
         return None
-    if taco.get("schema") != 1 or taco.get("project_type") != ProjectType.UV.value:
+    if taco.get("schema") != 1 or taco.get("project_type") not in {
+        project_type.value for project_type in ProjectType
+    }:
         return None
     if not isinstance(taco.get("version"), str) or not taco["version"]:
         return None
@@ -450,12 +555,22 @@ def _same_project(record: dict[str, Any], project_root: Path) -> bool:
         return False
 
 
-def _valid_uv_launcher(record: dict[str, Any]) -> bool:
-    """Validate Taco's non-shell uv kernel command shape without executing it."""
+def _valid_launcher(record: dict[str, Any]) -> bool:
+    """Validate Taco's manager or direct kernel command without executing it."""
     argv = record.get("argv")
     project = record.get("project")
-    if not isinstance(argv, list) or not project:
+    project_type = record.get("project_type")
+    interpreter = record.get("interpreter")
+    if not isinstance(argv, list) or not project or not interpreter:
         return False
+    if project_type != ProjectType.UV.value:
+        return argv == [
+            str(interpreter),
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
+        ]
     expected_tail = [
         "run",
         "--project",
@@ -489,7 +604,7 @@ def _record_is_stale(record: dict[str, Any]) -> bool:
         or not bool(record.get("project"))
         or not Path(str(record["project"])).is_dir()
         or not _executable_exists(str(record.get("launcher", "")))
-        or not _valid_uv_launcher(record)
+        or not _valid_launcher(record)
     )
 
 
@@ -546,27 +661,55 @@ def _check_kernel_collision(config: TacoConfig) -> None:
 
 
 def install_kernel(config: TacoConfig) -> Path:
-    """Install a user-discoverable kernelspec through uv's ipykernel overlay."""
-    if config.uv_executable is None or config.venv_path is None:
-        resolve_uv_environment(config)
+    """Prepare ipykernel and install a user-discoverable kernelspec."""
+    if config.interpreter is None or config.venv_path is None:
+        resolve_environment(config)
     _check_kernel_collision(config)
-    command = [
-        *_uv_run_prefix(config, with_ipykernel=True),
-        "python",
-        "-m",
-        "ipykernel",
-        "install",
-        "--user",
-        "--name",
-        config.kernel_name,
-        "--display-name",
-        config.display_name,
-    ]
+    if config.project_type is ProjectType.UV:
+        command = [
+            *_uv_run_prefix(config, with_ipykernel=True),
+            "python",
+            "-m",
+            "ipykernel",
+            "install",
+            "--user",
+            "--name",
+            config.kernel_name,
+            "--display-name",
+            config.display_name,
+        ]
+        prepare_command: list[str] | None = None
+    else:
+        if config.interpreter is None:  # pragma: no cover - guarded by resolution above
+            raise TacoError("Python interpreter was not resolved before kernel installation.")
+        prepare_command = [str(config.interpreter), "-m", "pip", "install"]
+        if config.project_type is ProjectType.PYTHON:
+            prepare_command.append("--user")
+        prepare_command.append("ipykernel")
+        command = [
+            str(config.interpreter),
+            "-m",
+            "ipykernel",
+            "install",
+            "--user",
+            "--name",
+            config.kernel_name,
+            "--display-name",
+            config.display_name,
+        ]
     kernelspec_dir = _get_kernelspec_dir(config)
     if config.dry_run:
+        if prepare_command is not None:
+            console.print(
+                f"PLAN  Ensure ipykernel is available: {shlex.join(prepare_command)}",
+                markup=False,
+                soft_wrap=True,
+            )
         console.print(f"PLAN  {shlex.join(command)}", markup=False, soft_wrap=True)
         console.print(f"PLAN  Write kernelspec to {kernelspec_dir}", markup=False, soft_wrap=True)
         return kernelspec_dir
+    if prepare_command is not None and not _is_package_importable(config.interpreter, "ipykernel"):
+        _run(prepare_command, cwd=config.project_root)
     _run(command, cwd=config.project_root)
     if not (kernelspec_dir / "kernel.json").is_file():
         raise TacoError(f"ipykernel did not create {kernelspec_dir / 'kernel.json'}")
@@ -574,7 +717,7 @@ def install_kernel(config: TacoConfig) -> Path:
 
 
 def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:
-    """Make a kernelspec durable, uv-backed, and explicitly Taco-owned."""
+    """Make a kernelspec durable and explicitly Taco-owned."""
     kernel_json = kernelspec_dir / "kernel.json"
     if config.dry_run:
         console.print(
@@ -586,26 +729,39 @@ def patch_kernelspec(kernelspec_dir: Path, config: TacoConfig) -> None:
     data = read_kernel_info(kernelspec_dir)
     if data is None:
         raise TacoError(f"Cannot read kernelspec: {kernel_json}")
-    if config.uv_executable is None or config.venv_path is None:
-        raise TacoError("uv environment was not resolved before kernelspec patching.")
+    if config.interpreter is None or config.venv_path is None:
+        raise TacoError("Python environment was not resolved before kernelspec patching.")
 
-    data["argv"] = [
-        str(config.uv_executable),
-        "run",
-        "--project",
-        str(config.project_root),
-        "--with",
-        "ipykernel",
-        "python",
-        "-m",
-        "ipykernel_launcher",
-        "-f",
-        "{connection_file}",
-    ]
+    if config.project_type is ProjectType.UV:
+        if config.uv_executable is None:
+            raise TacoError("uv was not resolved before kernelspec patching.")
+        data["argv"] = [
+            str(config.uv_executable),
+            "run",
+            "--project",
+            str(config.project_root),
+            "--with",
+            "ipykernel",
+            "python",
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
+        ]
+    else:
+        data["argv"] = [
+            str(config.interpreter),
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
+        ]
     env_value = data.get("env")
     spec_env = env_value if isinstance(env_value, dict) else {}
     spec_env.pop("VIRTUAL_ENV", None)
-    spec_env["UV_PROJECT_ENVIRONMENT"] = str(config.venv_path)
+    spec_env.pop("UV_PROJECT_ENVIRONMENT", None)
+    if config.project_type is ProjectType.UV:
+        spec_env["UV_PROJECT_ENVIRONMENT"] = str(config.venv_path)
     data["env"] = spec_env
     metadata_value = data.get("metadata")
     metadata = metadata_value if isinstance(metadata_value, dict) else {}
@@ -635,7 +791,12 @@ def _executable_exists(command: str) -> bool:
     return shutil.which(command) is not None
 
 
-def kernel_health(record: dict[str, Any], *, check_runtime: bool = True) -> dict[str, Any]:
+def kernel_health(
+    record: dict[str, Any],
+    *,
+    check_runtime: bool = True,
+    trusted_interpreter: Path | None = None,
+) -> dict[str, Any]:
     """Return structured static and runtime checks for one kernelspec."""
     checks: list[dict[str, Any]] = []
 
@@ -653,9 +814,14 @@ def kernel_health(record: dict[str, Any], *, check_runtime: bool = True) -> dict
         add("project", project.is_dir(), str(project))
         environment = Path(str(record.get("environment", "")))
         add("environment", environment.is_dir(), str(environment))
-        command_valid = _valid_uv_launcher(record)
-        add("command", command_valid, "valid uv launcher" if command_valid else "invalid command")
-        trusted_uv = shutil.which("uv")
+        command_valid = _valid_launcher(record)
+        project_type = str(record.get("project_type", ""))
+        add(
+            "command",
+            command_valid,
+            f"valid {project_type} launcher" if command_valid else "invalid command",
+        )
+        trusted_uv = shutil.which("uv") if project_type == ProjectType.UV.value else None
         if check_runtime and project.is_dir() and command_valid and trusted_uv:
             env = os.environ.copy()
             if record.get("environment"):
@@ -676,6 +842,25 @@ def kernel_health(record: dict[str, Any], *, check_runtime: bool = True) -> dict
                 add("runtime", True, "ipykernel imports through uv")
             except TacoError as exc:
                 add("runtime", False, str(exc).splitlines()[-1])
+        elif check_runtime and project.is_dir() and command_valid:
+            recorded = _absolute_path(str(record.get("interpreter", "")))
+            trusted_path = (
+                Path(os.path.abspath(trusted_interpreter))
+                if trusted_interpreter is not None
+                else None
+            )
+            if trusted_path is None or trusted_path != recorded:
+                add("runtime", False, "trusted project interpreter could not be resolved")
+            else:
+                try:
+                    _run(
+                        [str(trusted_path), "-c", "import ipykernel"],
+                        cwd=project,
+                        timeout=60,
+                    )
+                    add("runtime", True, "ipykernel imports through the project interpreter")
+                except TacoError as exc:
+                    add("runtime", False, str(exc).splitlines()[-1])
 
     return {"healthy": all(check["ok"] for check in checks), "checks": checks}
 
@@ -752,9 +937,9 @@ def _emit_json(payload: dict[str, Any]) -> None:
 
 
 def run_setup(config: TacoConfig) -> None:
-    """Create or refresh and verify a user-discoverable uv kernel."""
+    """Create or refresh and verify a user-discoverable Python kernel."""
     _check_kernel_collision(config)
-    resolve_uv_environment(config)
+    resolve_environment(config)
     mode = "DRY RUN" if config.dry_run else "SETUP"
     console.print(f"{mode}  Taco {__version__}")
     console.print(f"Project      {escape(str(config.project_root))}")
@@ -763,13 +948,13 @@ def run_setup(config: TacoConfig) -> None:
     console.print()
 
     if config.dry_run:
-        console.print("PLAN  Resolve the effective uv environment")
+        console.print(f"PLAN  Resolve the effective {config.project_type.value} environment")
         install_kernel(config)
         patch_kernelspec(_get_kernelspec_dir(config), config)
         console.print("\nDry run complete — no changes made.")
         return
 
-    console.print("OK    Effective uv environment resolved")
+    console.print(f"OK    Effective {config.project_type.value} environment resolved")
     kernelspec_dir = install_kernel(config)
     console.print("OK    ipykernel runtime prepared")
     patch_kernelspec(kernelspec_dir, config)
@@ -778,7 +963,13 @@ def run_setup(config: TacoConfig) -> None:
     record = _find_kernel(config)
     if record is None:
         raise TacoError("The installed kernel is not discoverable through Jupyter.")
-    health = kernel_health(record, check_runtime=True)
+    health = kernel_health(
+        record,
+        check_runtime=True,
+        trusted_interpreter=(
+            config.interpreter if config.project_type is not ProjectType.UV else None
+        ),
+    )
     if not health["healthy"]:
         failures = ", ".join(check["name"] for check in health["checks"] if not check["ok"])
         raise TacoError(f"Kernel verification failed: {failures}")
@@ -856,7 +1047,19 @@ def run_info(config: TacoConfig, *, json_output: bool = False) -> bool:
             console.print("Run `taco setup` to create it.")
         return False
 
-    health = kernel_health(record, check_runtime=True)
+    trusted_interpreter: Path | None = None
+    if record.get("project_type") != ProjectType.UV.value:
+        try:
+            if record.get("project_type") == config.project_type.value:
+                resolve_environment(config)
+                trusted_interpreter = config.interpreter
+        except TacoError:
+            pass
+    health = kernel_health(
+        record,
+        check_runtime=True,
+        trusted_interpreter=trusted_interpreter,
+    )
     payload = {
         "name": record["name"],
         "display_name": record["display_name"],

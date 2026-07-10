@@ -14,7 +14,6 @@ from taco import __version__
 from taco.core import (
     ProjectType,
     TacoConfig,
-    TacoError,
     _get_kernelspec_dir,
     _safe_kernel_dir,
     compute_missing_deps,
@@ -32,6 +31,7 @@ from taco.core import (
     patch_kernelspec,
     predict_uv_environment,
     remove_project_kernel,
+    resolve_environment,
     resolve_uv_environment,
     run_clean,
     sanitize_kernel_name,
@@ -95,8 +95,7 @@ def test_find_project_root_from_subdirectory(tmp_path: Path) -> None:
 
 def test_find_project_root_does_not_treat_requirements_as_uv(tmp_path: Path) -> None:
     (tmp_path / "requirements.txt").write_text("requests\n")
-    with pytest.raises(TacoError, match="No uv project"):
-        find_project_root(tmp_path)
+    assert find_project_root(tmp_path) == tmp_path
 
 
 def test_find_project_root_rejects_missing_explicit_path(tmp_path: Path) -> None:
@@ -108,18 +107,53 @@ def test_find_project_root_does_not_climb_from_explicit_directory(tmp_path: Path
     _pyproject(tmp_path / "pyproject.toml")
     child = tmp_path / "existing-but-not-a-project"
     child.mkdir()
-    with pytest.raises(TacoError, match="explicit path"):
-        find_project_root(child, explicit=True)
+    assert find_project_root(child, explicit=True) == child
 
 
-def test_detect_project_type_is_uv_only(tmp_path: Path) -> None:
-    _pyproject(tmp_path / "pyproject.toml")
+def test_detect_project_type_detects_uv_configuration(tmp_path: Path) -> None:
+    _pyproject(tmp_path / "pyproject.toml", extra="\n[tool.uv]\n")
     assert detect_project_type(tmp_path) is ProjectType.UV
 
 
-def test_detect_project_type_requires_pyproject(tmp_path: Path) -> None:
-    with pytest.raises(TacoError, match="supports uv projects"):
-        detect_project_type(tmp_path)
+def test_detect_project_type_detects_poetry_configuration(tmp_path: Path) -> None:
+    _pyproject(tmp_path / "pyproject.toml", extra="\n[tool.poetry]\n")
+    assert detect_project_type(tmp_path) is ProjectType.POETRY
+
+
+def test_detect_project_type_uses_active_conda_environment(tmp_path: Path, monkeypatch) -> None:
+    environment = tmp_path / "conda"
+    interpreter = environment / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("")
+    monkeypatch.setenv("CONDA_PREFIX", str(environment))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
+    assert detect_project_type(tmp_path) is ProjectType.CONDA
+
+
+def test_detect_project_type_uses_local_virtual_environment(tmp_path: Path, monkeypatch) -> None:
+    interpreter = tmp_path / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("")
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
+    assert detect_project_type(tmp_path) is ProjectType.VENV
+
+
+def test_detect_project_type_falls_back_to_python(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    assert detect_project_type(tmp_path) is ProjectType.PYTHON
+
+
+def test_uv_environment_variable_does_not_turn_plain_directory_into_uv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / ".custom"))
+    monkeypatch.delenv("CONDA_PREFIX", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    assert detect_project_type(tmp_path) is ProjectType.PYTHON
 
 
 @pytest.mark.parametrize(
@@ -169,6 +203,12 @@ def test_venv_interpreter_uses_windows_scripts_when_present(tmp_path: Path) -> N
     assert venv_interpreter(tmp_path) == interpreter
 
 
+def test_venv_interpreter_supports_conda_windows_layout(tmp_path: Path) -> None:
+    interpreter = tmp_path / "python.exe"
+    interpreter.write_text("")
+    assert venv_interpreter(tmp_path) == interpreter
+
+
 def test_resolve_uv_environment_uses_uv_reported_paths(tmp_path: Path) -> None:
     _pyproject(tmp_path / "pyproject.toml")
     config = _config(tmp_path)
@@ -188,6 +228,103 @@ def test_resolve_uv_environment_uses_uv_reported_paths(tmp_path: Path) -> None:
 
     assert config.venv_path == tmp_path / ".custom"
     assert config.interpreter == tmp_path / ".custom" / "bin" / "python"
+
+
+def test_resolve_poetry_environment_uses_poetry_reported_paths(tmp_path: Path) -> None:
+    _pyproject(tmp_path / "pyproject.toml", extra="\n[tool.poetry]\n")
+    config = _config(tmp_path, project_type=ProjectType.POETRY)
+    payload = json.dumps(
+        {
+            "interpreter": str(tmp_path / ".poetry" / "bin" / "python"),
+            "environment": str(tmp_path / ".poetry"),
+        }
+    )
+    completed = subprocess.CompletedProcess([], 0, stdout=f"{payload}\n", stderr="")
+
+    with (
+        patch("taco.core._executable", return_value=Path("/usr/local/bin/poetry")),
+        patch("taco.core._run", return_value=completed) as run,
+    ):
+        resolve_environment(config)
+
+    assert run.call_args.args[0][:3] == ["/usr/local/bin/poetry", "run", "python"]
+    assert config.venv_path == tmp_path / ".poetry"
+    assert config.interpreter == tmp_path / ".poetry" / "bin" / "python"
+
+
+def test_resolve_base_python_uses_path_interpreter(tmp_path: Path) -> None:
+    config = _config(tmp_path, project_type=ProjectType.PYTHON)
+    payload = json.dumps({"interpreter": "/usr/local/bin/python3", "environment": "/usr/local"})
+    completed = subprocess.CompletedProcess([], 0, stdout=f"{payload}\n", stderr="")
+
+    with (
+        patch("taco.core.shutil.which", side_effect=lambda name: "/usr/local/bin/python3"),
+        patch("taco.core._run", return_value=completed) as run,
+    ):
+        resolve_environment(config)
+
+    assert run.call_args.args[0][0] == "/usr/local/bin/python3"
+    assert config.interpreter == Path("/usr/local/bin/python3")
+    assert config.venv_path == Path("/usr/local")
+
+
+def test_resolve_environment_preserves_virtualenv_interpreter_symlink(tmp_path: Path) -> None:
+    environment = tmp_path / ".venv"
+    interpreter = environment / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    config = _config(tmp_path, project_type=ProjectType.VENV)
+    payload = json.dumps({"interpreter": str(interpreter), "environment": str(environment)})
+    completed = subprocess.CompletedProcess([], 0, stdout=f"{payload}\n", stderr="")
+
+    with patch("taco.core._run", return_value=completed):
+        resolve_environment(config)
+
+    assert config.interpreter == interpreter
+    assert config.interpreter != interpreter.resolve()
+
+
+def test_health_check_executes_virtualenv_symlink_not_base_python(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    environment = project / ".venv"
+    interpreter = environment / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    record = {
+        "argv": [
+            str(interpreter),
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
+        ],
+        "launcher": str(interpreter),
+        "interpreter": str(interpreter),
+        "project_type": "venv",
+        "project": str(project),
+        "environment": str(environment),
+        "managed_by_taco": True,
+        "valid": True,
+        "error": "",
+    }
+    completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    with patch("taco.core._run", return_value=completed) as run:
+        health = kernel_health(record, trusted_interpreter=interpreter)
+
+    assert run.call_args.args[0][0] == str(interpreter)
+    assert health["healthy"]
+
+    other_interpreter = tmp_path / "other-venv" / "bin" / "python"
+    other_interpreter.parent.mkdir(parents=True)
+    other_interpreter.symlink_to(sys.executable)
+    with patch("taco.core._run") as run:
+        mismatched_health = kernel_health(
+            record,
+            trusted_interpreter=other_interpreter,
+        )
+    run.assert_not_called()
+    assert not mismatched_health["healthy"]
 
 
 def test_compute_missing_deps() -> None:
@@ -246,6 +383,43 @@ def test_patch_kernelspec_writes_uv_launcher_and_ownership(tmp_path: Path) -> No
     assert is_taco_managed(data)
 
 
+def test_patch_kernelspec_writes_direct_interpreter_launcher(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    environment = tmp_path / "conda" / "envs" / "science"
+    interpreter = environment / "bin" / "python"
+    kernel_dir = tmp_path / "kernels" / "science"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "kernel.json").write_text(
+        json.dumps(
+            {
+                "argv": ["temporary-python"],
+                "display_name": "Python (science)",
+                "language": "python",
+                "env": {"VIRTUAL_ENV": "/old", "UV_PROJECT_ENVIRONMENT": "/old-uv"},
+            }
+        )
+    )
+    config = _config(project, name="science", project_type=ProjectType.CONDA)
+    config.venv_path = environment
+    config.interpreter = interpreter
+
+    patch_kernelspec(kernel_dir, config)
+    data = json.loads((kernel_dir / "kernel.json").read_text())
+
+    assert data["argv"] == [
+        str(interpreter),
+        "-m",
+        "ipykernel_launcher",
+        "-f",
+        "{connection_file}",
+    ]
+    assert "VIRTUAL_ENV" not in data["env"]
+    assert "UV_PROJECT_ENVIRONMENT" not in data["env"]
+    assert data["metadata"]["taco"]["project_type"] == "conda"
+    assert is_taco_managed(data)
+
+
 def test_install_kernel_uses_user_registration(tmp_path: Path, monkeypatch) -> None:
     project = tmp_path / "project"
     project.mkdir()
@@ -274,6 +448,42 @@ def test_install_kernel_uses_user_registration(tmp_path: Path, monkeypatch) -> N
     assert result == user_dir / "example"
     assert "--user" in commands[0]
     assert "--prefix" not in commands[0]
+
+
+def test_install_kernel_prepares_ipykernel_in_direct_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    environment = tmp_path / "venv"
+    interpreter = environment / "bin" / "python"
+    user_dir = tmp_path / "jupyter" / "kernels"
+    monkeypatch.setattr("taco.core.get_user_kernel_dir", lambda: user_dir)
+    monkeypatch.setattr("taco.core.get_all_kernel_dirs", lambda: [user_dir])
+    config = _config(project, project_type=ProjectType.VENV)
+    config.venv_path = environment
+    config.interpreter = interpreter
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs):
+        commands.append(command)
+        if "install" in command and "--name" in command:
+            kernel_dir = user_dir / "example"
+            kernel_dir.mkdir(parents=True)
+            (kernel_dir / "kernel.json").write_text(
+                json.dumps({"argv": [str(interpreter)], "display_name": "Example"})
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    with (
+        patch("taco.core._is_package_importable", return_value=False),
+        patch("taco.core._run", side_effect=fake_run),
+    ):
+        result = install_kernel(config)
+
+    assert result == user_dir / "example"
+    assert commands[0] == [str(interpreter), "-m", "pip", "install", "ipykernel"]
+    assert commands[1][:4] == [str(interpreter), "-m", "ipykernel", "install"]
 
 
 def test_discovery_surfaces_invalid_and_null_env_specs(tmp_path: Path, monkeypatch) -> None:
@@ -323,6 +533,8 @@ def test_health_check_never_executes_stored_launcher(tmp_path: Path) -> None:
         "launcher": data["argv"][0],
         "project": str(project),
         "environment": str(environment),
+        "interpreter": data["metadata"]["taco"]["interpreter"],
+        "project_type": "uv",
         "managed_by_taco": True,
         "valid": True,
         "error": "",
@@ -359,6 +571,44 @@ def test_health_check_does_not_execute_invalid_command_shape(tmp_path: Path) -> 
 
     run.assert_not_called()
     assert not health["healthy"]
+
+
+def test_health_check_only_executes_a_resolved_direct_interpreter(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    environment = project / ".venv"
+    interpreter = environment / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("")
+    record = {
+        "name": "example",
+        "path": str(tmp_path / "kernels" / "example"),
+        "argv": [
+            str(interpreter),
+            "-m",
+            "ipykernel_launcher",
+            "-f",
+            "{connection_file}",
+        ],
+        "launcher": str(interpreter),
+        "interpreter": str(interpreter),
+        "project_type": "venv",
+        "project": str(project),
+        "environment": str(environment),
+        "managed_by_taco": True,
+        "valid": True,
+        "error": "",
+    }
+
+    with patch("taco.core._run") as run:
+        untrusted_health = kernel_health(record)
+    run.assert_not_called()
+    assert not untrusted_health["healthy"]
+
+    completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+    with patch("taco.core._run", return_value=completed) as run:
+        trusted_health = kernel_health(record, trusted_interpreter=interpreter)
+    assert run.call_args.args[0][0] == str(interpreter)
+    assert trusted_health["healthy"]
 
 
 def test_remove_project_kernel_preserves_foreign_collision(tmp_path: Path, monkeypatch) -> None:

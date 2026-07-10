@@ -1,4 +1,4 @@
-"""End-to-end tests using real uv projects and a real Jupyter kernel."""
+"""End-to-end tests using real Python environments and Jupyter kernels."""
 
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ def _init_uv_project(path: Path, name: str, env: dict[str, str]) -> None:
         env=env,
     )
     assert result.returncode == 0, result.stderr
+    with (path / "pyproject.toml").open("a") as file:
+        file.write("\n[tool.uv]\n")
 
 
 def _run_taco(
@@ -101,7 +103,7 @@ def test_fresh_project_is_discoverable_and_launches(
     project = tmp_path / "fresh"
     _init_uv_project(project, "fresh", env)
     with (project / "pyproject.toml").open("a") as file:
-        file.write("\n[tool.uv]\ndefault-groups = []\n")
+        file.write("default-groups = []\n")
 
     result = _run_taco(project, env)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
@@ -120,6 +122,34 @@ def test_fresh_project_is_discoverable_and_launches(
     sync = _run(["uv", "sync"], cwd=project, env=env)
     assert sync.returncode == 0, sync.stderr
     assert _execute_kernel("fresh", project) == "42"
+
+
+@pytest.mark.integration
+def test_standard_virtual_environment_is_discoverable_and_launches(
+    tmp_path: Path,
+    isolated_env: tuple[Path, dict[str, str]],
+) -> None:
+    data_dir, env = isolated_env
+    project = tmp_path / "standard-venv"
+    project.mkdir()
+    (project / "requirements.txt").write_text("# managed outside Taco\n")
+    environment = project / ".venv"
+    created = _run(
+        [sys.executable, "-m", "venv", "--system-site-packages", str(environment)],
+        cwd=project,
+        env=env,
+    )
+    assert created.returncode == 0, created.stderr
+    env["VIRTUAL_ENV"] = str(environment)
+
+    result = _run_taco(project, env)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    data = json.loads((data_dir / "kernels" / "standard-venv" / "kernel.json").read_text())
+    assert data["metadata"]["taco"]["project_type"] == "venv"
+    assert Path(data["metadata"]["taco"]["environment"]) == environment
+    assert Path(data["argv"][0]).is_relative_to(environment)
+    assert _execute_kernel("standard-venv", project) == "42"
 
 
 @pytest.mark.integration
