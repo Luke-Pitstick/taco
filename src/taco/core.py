@@ -660,6 +660,34 @@ def _check_kernel_collision(config: TacoConfig) -> None:
         )
 
 
+def _direct_ipykernel_install_command(config: TacoConfig) -> list[str]:
+    """Choose an installer for ipykernel in a resolved direct environment."""
+    if config.interpreter is None:  # pragma: no cover - guarded by resolution
+        raise TacoError("Python interpreter was not resolved before dependency installation.")
+    if _is_package_importable(config.interpreter, "pip"):
+        command = [str(config.interpreter), "-m", "pip", "install"]
+        if config.project_type is ProjectType.PYTHON:
+            command.append("--user")
+        return [*command, "ipykernel"]
+    if uv := shutil.which("uv"):
+        return [
+            str(_absolute_path(uv)),
+            "pip",
+            "install",
+            "--python",
+            str(config.interpreter),
+            "ipykernel",
+        ]
+    recovery = shlex.join(
+        ["uv", "pip", "install", "--python", str(config.interpreter), "ipykernel"]
+    )
+    raise TacoError(
+        f"ipykernel is missing from {config.interpreter}, and that Python cannot import pip. "
+        "Install ipykernel with its environment manager, or install uv and run: "
+        f"{recovery}"
+    )
+
+
 def install_kernel(config: TacoConfig) -> Path:
     """Prepare ipykernel and install a user-discoverable kernelspec."""
     if config.interpreter is None or config.venv_path is None:
@@ -682,10 +710,11 @@ def install_kernel(config: TacoConfig) -> Path:
     else:
         if config.interpreter is None:  # pragma: no cover - guarded by resolution above
             raise TacoError("Python interpreter was not resolved before kernel installation.")
-        prepare_command = [str(config.interpreter), "-m", "pip", "install"]
-        if config.project_type is ProjectType.PYTHON:
-            prepare_command.append("--user")
-        prepare_command.append("ipykernel")
+        prepare_command = (
+            None
+            if _is_package_importable(config.interpreter, "ipykernel")
+            else _direct_ipykernel_install_command(config)
+        )
         command = [
             str(config.interpreter),
             "-m",
@@ -708,7 +737,7 @@ def install_kernel(config: TacoConfig) -> Path:
         console.print(f"PLAN  {shlex.join(command)}", markup=False, soft_wrap=True)
         console.print(f"PLAN  Write kernelspec to {kernelspec_dir}", markup=False, soft_wrap=True)
         return kernelspec_dir
-    if prepare_command is not None and not _is_package_importable(config.interpreter, "ipykernel"):
+    if prepare_command is not None:
         _run(prepare_command, cwd=config.project_root)
     _run(command, cwd=config.project_root)
     if not (kernelspec_dir / "kernel.json").is_file():

@@ -86,6 +86,21 @@ def _execute_kernel(kernel_name: str, project: Path) -> str:
             manager.shutdown_kernel(now=True)
 
 
+def _assert_venv_kernel_ready(
+    data_dir: Path,
+    project: Path,
+    environment: Path,
+    result: subprocess.CompletedProcess[str],
+) -> None:
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "Kernel runtime verified" in result.stdout
+    data = json.loads((data_dir / "kernels" / project.name / "kernel.json").read_text())
+    assert data["metadata"]["taco"]["project_type"] == "venv"
+    assert Path(data["metadata"]["taco"]["environment"]) == environment
+    assert Path(data["argv"][0]).is_relative_to(environment)
+    assert _execute_kernel(project.name, project) == "42"
+
+
 @pytest.fixture()
 def isolated_env(tmp_path: Path, monkeypatch) -> tuple[Path, dict[str, str]]:
     data_dir = tmp_path / "jupyter"
@@ -143,13 +158,38 @@ def test_standard_virtual_environment_is_discoverable_and_launches(
     env["VIRTUAL_ENV"] = str(environment)
 
     result = _run_taco(project, env)
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    _assert_venv_kernel_ready(data_dir, project, environment, result)
 
-    data = json.loads((data_dir / "kernels" / "standard-venv" / "kernel.json").read_text())
-    assert data["metadata"]["taco"]["project_type"] == "venv"
-    assert Path(data["metadata"]["taco"]["environment"]) == environment
-    assert Path(data["argv"][0]).is_relative_to(environment)
-    assert _execute_kernel("standard-venv", project) == "42"
+
+@pytest.mark.integration
+def test_uv_created_virtual_environment_without_pip_is_discoverable_and_launches(
+    tmp_path: Path,
+    isolated_env: tuple[Path, dict[str, str]],
+) -> None:
+    data_dir, env = isolated_env
+    project = tmp_path / "pipless-venv"
+    project.mkdir()
+    environment = project / ".venv"
+    created = _run(
+        ["uv", "venv", "--python", sys.executable, str(environment)],
+        cwd=project,
+        env=env,
+    )
+    assert created.returncode == 0, created.stderr
+    env["VIRTUAL_ENV"] = str(environment)
+    interpreter = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    pip_probe = _run(
+        [str(interpreter), "-c", "import pip"],
+        cwd=project,
+        env=env,
+    )
+    assert pip_probe.returncode != 0
+    assert "No module named" in pip_probe.stderr
+    assert "pip" in pip_probe.stderr
+
+    result = _run_taco(project, env)
+    _assert_venv_kernel_ready(data_dir, project, environment, result)
 
 
 @pytest.mark.integration

@@ -14,6 +14,7 @@ from taco import __version__
 from taco.core import (
     ProjectType,
     TacoConfig,
+    TacoError,
     _get_kernelspec_dir,
     _safe_kernel_dir,
     compute_missing_deps,
@@ -450,9 +451,7 @@ def test_install_kernel_uses_user_registration(tmp_path: Path, monkeypatch) -> N
     assert "--prefix" not in commands[0]
 
 
-def test_install_kernel_prepares_ipykernel_in_direct_environment(
-    tmp_path: Path, monkeypatch
-) -> None:
+def _direct_install_case(tmp_path: Path, monkeypatch) -> tuple[TacoConfig, Path, Path]:
     project = tmp_path / "project"
     project.mkdir()
     environment = tmp_path / "venv"
@@ -463,6 +462,10 @@ def test_install_kernel_prepares_ipykernel_in_direct_environment(
     config = _config(project, project_type=ProjectType.VENV)
     config.venv_path = environment
     config.interpreter = interpreter
+    return config, interpreter, user_dir
+
+
+def _kernel_install_recorder(user_dir: Path, interpreter: Path):
     commands: list[list[str]] = []
 
     def fake_run(command: list[str], **_kwargs):
@@ -475,8 +478,20 @@ def test_install_kernel_prepares_ipykernel_in_direct_environment(
             )
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    return commands, fake_run
+
+
+def test_install_kernel_prepares_ipykernel_in_direct_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, interpreter, user_dir = _direct_install_case(tmp_path, monkeypatch)
+    commands, fake_run = _kernel_install_recorder(user_dir, interpreter)
+
     with (
-        patch("taco.core._is_package_importable", return_value=False),
+        patch(
+            "taco.core._is_package_importable",
+            side_effect=lambda _interpreter, package: package == "pip",
+        ),
         patch("taco.core._run", side_effect=fake_run),
     ):
         result = install_kernel(config)
@@ -484,6 +499,57 @@ def test_install_kernel_prepares_ipykernel_in_direct_environment(
     assert result == user_dir / "example"
     assert commands[0] == [str(interpreter), "-m", "pip", "install", "ipykernel"]
     assert commands[1][:4] == [str(interpreter), "-m", "ipykernel", "install"]
+
+
+def test_install_kernel_uses_uv_when_direct_environment_has_no_pip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, interpreter, user_dir = _direct_install_case(tmp_path, monkeypatch)
+    uv = Path("/usr/local/bin/uv")
+    commands, fake_run = _kernel_install_recorder(user_dir, interpreter)
+
+    with (
+        patch("taco.core._is_package_importable", return_value=False),
+        patch("taco.core.shutil.which", return_value=str(uv)),
+        patch("taco.core._run", side_effect=fake_run),
+    ):
+        result = install_kernel(config)
+
+    assert result == user_dir / "example"
+    assert commands[0] == [
+        str(uv),
+        "pip",
+        "install",
+        "--python",
+        str(interpreter),
+        "ipykernel",
+    ]
+    assert commands[1][:4] == [str(interpreter), "-m", "ipykernel", "install"]
+
+
+def test_install_kernel_explains_when_no_package_installer_is_available(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, interpreter, _user_dir = _direct_install_case(tmp_path, monkeypatch)
+
+    with (
+        patch("taco.core._is_package_importable", return_value=False),
+        patch("taco.core.shutil.which", return_value=None),
+        patch(
+            "taco.core._run",
+            side_effect=TacoError(f"{interpreter}: No module named pip"),
+        ) as run,
+        pytest.raises(TacoError) as error,
+    ):
+        install_kernel(config)
+
+    message = str(error.value)
+    assert "ipykernel is missing" in message
+    assert "cannot import pip" in message
+    assert f"uv pip install --python {interpreter} ipykernel" in message
+    assert "environment manager" in message
+    assert "No module named pip" not in message
+    run.assert_not_called()
 
 
 def test_discovery_surfaces_invalid_and_null_env_specs(tmp_path: Path, monkeypatch) -> None:

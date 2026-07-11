@@ -54,7 +54,9 @@ evolve. The package has not yet been published under a unique Python distributio
 ## Requirements
 
 - Python 3.10 or newer to run Taco.
-- uv only when Taco detects a uv project; Poetry only when it detects a Poetry project.
+- uv when Taco detects a uv project. For other environments uv is optional, but Taco uses it as a
+  fallback installer when the selected Python does not provide `pip`.
+- Poetry when Taco detects a Poetry project.
 - A Jupyter-compatible notebook frontend, installed separately. Taco registers kernels but does not
   install JupyterLab or an editor extension.
 - Network access when the selected environment or `ipykernel` must be created or installed.
@@ -191,8 +193,10 @@ uv's normal rules, while `poetry run` may create a Poetry environment. Taco then
 2. Ensures `ipykernel` is available.
    - uv uses an ephemeral `uv run --with ipykernel` overlay; Taco does not add `ipykernel` to the
      project's declared dependencies.
-   - Other environments keep using their resolved interpreter. If `ipykernel` is missing, Taco runs
-     that interpreter's `pip install ipykernel` (`--user` for plain base Python).
+   - Other environments keep using their resolved interpreter. If `ipykernel` is missing, Taco uses
+     that interpreter's `pip` module when available (`--user` for plain base Python). If the
+     interpreter has no `pip`, Taco uses `uv pip install --python <interpreter> ipykernel` when uv is
+     available.
 3. Writes a kernelspec to Jupyter's per-user data directory.
 4. Replaces the temporary command with a durable launcher.
 5. Adds Taco ownership metadata, including the project, environment, interpreter, and strategy.
@@ -550,10 +554,13 @@ manager or remove stale metadata if the project no longer uses it.
 
 ### `ipykernel` could not be installed
 
-Install it with the selected environment manager, then rerun Taco:
+Taco supports virtual environments created without `pip`: when uv is on `PATH`, it installs into the
+exact selected interpreter with `uv pip install --python`. If neither `pip` nor uv is available,
+install `ipykernel` with the selected environment manager, then rerun Taco:
 
 ```bash
 uv add --dev ipykernel
+uv pip install --python /path/to/environment/bin/python ipykernel
 poetry add --group dev ipykernel
 conda install ipykernel
 python -m pip install ipykernel
