@@ -32,7 +32,7 @@ Issues = "https://github.com/Luke-Pitstick/taco/issues"
 Repository = "https://github.com/Luke-Pitstick/taco.git"
 
 [project.scripts]
-taco = "taco.cli:app"
+taco = "taco.cli:cli"
 
 [build-system]
 requires = ["hatchling"]

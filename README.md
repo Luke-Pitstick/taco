@@ -2,29 +2,65 @@
   <img src="assets/taco.jpg" alt="Taco mascot" width="320" />
 </p>
 
-# Taco
+<h1 align="center">Taco</h1>
+
+<p align="center">
+  <strong>Durable Jupyter kernels for the Python environment you actually selected.</strong><br />
+  Resolve it, register it, verify it, and keep it manageable from one CLI.
+</p>
+
+<p align="center">
+  <img alt="Project status: beta" src="https://img.shields.io/badge/status-beta-f59e0b" />
+  <img alt="Python 3.10 or newer" src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" />
+  <img alt="Install from Git" src="https://img.shields.io/badge/package-install%20from%20Git-6f42c1" />
+</p>
+
+<p align="center">
+  <a href="#install-taco">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#automation-and-exit-codes">Automation</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
 Taco creates named, discoverable Jupyter kernels for Python environments. It resolves the
 interpreter selected by uv, Poetry, Conda, a standard virtual environment, or your shell; registers
 a user-visible kernelspec; and verifies the kernel before reporting success.
 
-Taco works with:
+## Why Taco
 
-- uv projects and workspace members;
-- Poetry projects;
-- active Anaconda, Miniconda, Conda, and Mamba environments;
-- `venv`, `virtualenv`, and tools that expose `VIRTUAL_ENV` or a project-local `.venv`;
-- plain Python installations found on `PATH`.
+Notebook frontends discover kernels globally, while Python environments are usually project-local.
+Taco bridges that gap without asking an editor or Jupyter process to inherit an activated shell:
+
+- **Manager-aware resolution** — follows uv workspaces, Poetry, `CONDA_PREFIX`, `VIRTUAL_ENV`, a
+  project-local `.venv`, or Python on `PATH`.
+- **Durable launchers** — records an absolute project and environment so GUI applications can start
+  the same runtime later.
+- **Safe lifecycle commands** — previews setup, refuses ambiguous collisions, and removes only
+  kernels carrying valid Taco ownership metadata.
+- **Useful diagnostics** — separates fast static inventory from active runtime checks and provides
+  machine-readable JSON for automation.
 
 ## Project status
 
-Taco is beta software. The command-line interface and kernelspec metadata are stable enough for
-regular use, but the package has not yet been published under a unique Python distribution name.
+Taco is beta software. It is useful for regular local workflows, but its CLI and metadata may still
+evolve. The package has not yet been published under a unique Python distribution name.
 
 > [!WARNING]
 > The `taco` project currently on PyPI is unrelated software. Do not run `pip install taco`,
 > `pipx install taco`, or `uv tool install taco`. Install Taco from this repository until an
 > official distribution is published.
+
+## Requirements
+
+- Python 3.10 or newer to run Taco.
+- uv only when Taco detects a uv project; Poetry only when it detects a Poetry project.
+- A Jupyter-compatible notebook frontend, installed separately. Taco registers kernels but does not
+  install JupyterLab or an editor extension.
+- Network access when the selected environment or `ipykernel` must be created or installed.
+
+Taco has no configuration file. Its inputs are CLI options plus the standard environment variables
+`UV_PROJECT_ENVIRONMENT`, `CONDA_PREFIX`, `VIRTUAL_ENV`, and `JUPYTER_DATA_DIR`.
 
 ## Install Taco
 
@@ -78,7 +114,7 @@ taco setup
 
 # venv / virtualenv
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate  # On Windows, use your shell's standard activation command.
 taco setup
 
 # Anaconda / Miniconda / Conda / Mamba
@@ -107,6 +143,24 @@ Ready  Python (forecasting) is available in Jupyter and VS Code.
 
 Open a notebook and select `Python (forecasting)` from the kernel picker.
 
+By default, both the kernelspec name and display name come from the project directory. Use
+`--name` for a globally unique kernelspec name and `--display-name` for the label shown by notebook
+frontends.
+
+## Configuration
+
+Taco deliberately has no configuration file. These inputs control discovery and placement:
+
+| Input | Effect |
+|---|---|
+| `--project`, `-p` | Select a project or working directory explicitly |
+| `--name`, `-n` | Set the global Jupyter kernelspec name |
+| `--display-name` | Set the label shown in kernel pickers during setup |
+| `UV_PROJECT_ENVIRONMENT` | Select a custom uv environment location |
+| `CONDA_PREFIX` | Select the active Conda-family environment |
+| `VIRTUAL_ENV` | Select the active standard virtual environment |
+| `JUPYTER_DATA_DIR` | Override Jupyter's per-user data directory using Jupyter's standard behavior |
+
 ## How Taco chooses an environment
 
 Taco uses the first matching strategy:
@@ -129,11 +183,14 @@ are identified by their Poetry table or lockfile.
 
 ## What `taco setup` changes
 
-Taco is explicit about its side effects:
+Normal setup is not read-only: it can access the network and create or synchronize the selected
+environment. In particular, `uv run` may create or sync an environment and resolve lock state under
+uv's normal rules, while `poetry run` may create a Poetry environment. Taco then:
 
 1. Resolves the selected environment's real `sys.executable` and `sys.prefix`.
 2. Ensures `ipykernel` is available.
-   - uv uses an ephemeral `uv run --with ipykernel` overlay and does not edit project dependencies.
+   - uv uses an ephemeral `uv run --with ipykernel` overlay; Taco does not add `ipykernel` to the
+     project's declared dependencies.
    - Other environments keep using their resolved interpreter. If `ipykernel` is missing, Taco runs
      that interpreter's `pip install ipykernel` (`--user` for plain base Python).
 3. Writes a kernelspec to Jupyter's per-user data directory.
@@ -141,9 +198,9 @@ Taco is explicit about its side effects:
 5. Adds Taco ownership metadata, including the project, environment, interpreter, and strategy.
 6. Verifies Jupyter discovery and imports `ipykernel` through the final runtime.
 
-For Poetry and non-uv environments, installing a missing `ipykernel` changes the selected Python
-environment but does not edit `pyproject.toml`, `poetry.lock`, `requirements.txt`, or Conda YAML
-files. Add `ipykernel` through your manager first if you want it recorded as a declared dependency.
+For Poetry and non-uv environments, Taco's fallback installation changes the selected Python
+environment but does not add `ipykernel` to `pyproject.toml`, `requirements.txt`, or Conda YAML
+files. Add it through your manager first if you want it recorded as a declared dependency.
 
 Preview the plan without creating an environment, installing packages, or writing a kernelspec:
 
@@ -181,6 +238,14 @@ GUI or another terminal. Moving or deleting that environment makes the kernel st
 Run `taco` or `taco --help` for the command overview. Setup is explicit; invoking `taco` with no
 subcommand never changes a project.
 
+| Command | Purpose |
+|---|---|
+| `taco setup` | Create or refresh a project kernel, then verify its runtime |
+| `taco list` | Inventory kernels using fast, static checks only |
+| `taco info` | Diagnose one project kernel, including an active runtime import |
+| `taco remove` | Remove one exact Taco-owned project kernel |
+| `taco clean` | Preview, confirm, or remove stale Taco-owned kernels |
+
 ### `taco setup`
 
 Create or refresh a project kernel and verify its runtime.
@@ -212,6 +277,9 @@ Kernel names may contain only ASCII letters, numbers, `.`, `_`, and `-`. Taco re
 foreign kernel or another project's same-named kernel. Choose a unique `--name`; use `--force` only
 when intentionally replacing the user-level spec at that exact path.
 
+If setup uses a custom `--name`, pass that same name to later `taco info` and `taco remove`
+commands. `taco list` includes it in the diagnostic command printed for an unhealthy kernel.
+
 ### `taco list`
 
 List Taco-managed kernels and their static health state:
@@ -222,13 +290,23 @@ taco list --all
 taco list --json
 ```
 
+`list` never launches a kernel. It checks the kernelspec, launcher, project, environment, and
+command shape; unhealthy human-readable rows name the failed checks and print a project-specific
+`taco info` command for the active runtime diagnosis. `--all` also includes kernels not managed by
+Taco.
+
 ### `taco info`
 
 Inspect one project's kernel and run discovery, launcher, project, environment, and runtime checks:
 
+```text
+taco info [--project DIRECTORY] [--name NAME] [--json]
+```
+
 ```bash
 taco info
 taco info --project ~/projects/forecasting
+taco info --project ~/projects/forecasting --name forecasting-gpu
 taco info --json
 ```
 
@@ -238,9 +316,14 @@ The command exits with status `1` when the kernel is missing or unhealthy.
 
 Remove only the Taco-owned kernelspec associated with a project:
 
+```text
+taco remove [--project DIRECTORY] [--name NAME] [--dry-run]
+```
+
 ```bash
 taco remove
 taco remove --project ~/projects/forecasting
+taco remove --project ~/projects/forecasting --name forecasting-gpu
 taco remove --dry-run
 ```
 
@@ -249,7 +332,7 @@ kernel is an idempotent success.
 
 ### `taco clean`
 
-Find Taco-owned kernels whose project or launcher no longer exists:
+Find Taco-owned kernels whose project, launcher, or validated launch command is no longer usable:
 
 ```bash
 taco clean --dry-run
@@ -257,7 +340,8 @@ taco clean
 taco clean --yes
 ```
 
-`clean` ignores kernels that do not carry valid Taco ownership metadata.
+`clean` ignores kernels that do not carry valid Taco ownership metadata. It prompts before deletion
+on a terminal; scripts must pass `--yes` to remove or `--dry-run` to preview stale kernels.
 
 ### Version and completion
 
@@ -266,6 +350,25 @@ taco --version
 taco --show-completion
 taco --install-completion
 ```
+
+## Automation and exit codes
+
+`taco list --json` and `taco info --json` each write one JSON document to stdout. List records keep
+their existing inventory fields and include a `checks` array of `{name, ok, detail}` objects. The
+list checks are static; `info` performs the active runtime check. The JSON format is useful for
+scripts but is not yet declared a versioned compatibility contract while Taco is beta.
+
+| Outcome | Exit status |
+|---|---:|
+| Successful command, including idempotent remove and clean no-op | `0` |
+| Missing or unhealthy `taco info` target | `1` |
+| Expected operational failure | `1` |
+| Invalid option, argument, or usage | `2` |
+| Operation interrupted with <kbd>Ctrl</kbd>+<kbd>C</kbd> | `130` |
+
+`taco list` exits `0` even when it reports unhealthy kernels so automation can inspect every record.
+In a non-interactive session, `taco clean` exits `1` when stale kernels exist and neither `--yes` nor
+`--dry-run` was supplied.
 
 ## Environment recipes
 
@@ -391,20 +494,22 @@ uv tool uninstall taco
 
 ## Support matrix
 
-| Capability | Status |
+This table describes coverage in the repository, not a hosted cross-platform CI guarantee.
+
+| Capability | Repository coverage |
 |---|---|
-| uv projects and workspace members | Integration tested |
-| `UV_PROJECT_ENVIRONMENT` | Integration tested |
-| Standard `venv` / `virtualenv` | Integration tested |
-| Poetry | Unit tested; uses Poetry's reported interpreter |
-| Anaconda / Miniconda / Conda / Mamba | Unit tested through `CONDA_PREFIX` |
-| Plain/base Python | Unit tested through `PATH` |
+| uv projects and workspace members | Covered by end-to-end tests |
+| `UV_PROJECT_ENVIRONMENT` | Covered by end-to-end tests |
+| Standard `venv` / `virtualenv` | Covered by end-to-end tests |
+| Poetry | Unit coverage; uses Poetry's reported interpreter |
+| Anaconda / Miniconda / Conda / Mamba | Unit coverage through `CONDA_PREFIX` |
+| Plain/base Python | Unit coverage through `PATH` |
 | Other `.venv` / `VIRTUAL_ENV` managers | Supported through the generic interpreter path |
-| External Jupyter discovery | Integration tested |
-| Live kernel startup and code execution | Integration tested |
-| macOS | Actively tested |
-| Linux | Uses Python and Jupyter platform APIs; testing welcome |
-| Windows | Uses Python and Jupyter platform APIs; testing welcome |
+| External Jupyter discovery | Covered by end-to-end tests |
+| Live kernel startup and code execution | Covered by end-to-end tests |
+| macOS | Primary development platform |
+| Linux | Designed around Python and Jupyter platform APIs; validation welcome |
+| Windows | Platform-aware interpreter paths are unit covered; broader validation welcome |
 
 ## Development
 
@@ -422,6 +527,9 @@ uv run pytest
 # Lint and formatting
 uv run ruff check src tests
 uv run ruff format --check src tests
+
+# Build wheel and source distribution
+uv build
 ```
 
 The integration suite isolates `JUPYTER_DATA_DIR`, starts real kernels, executes notebook code, and

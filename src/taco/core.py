@@ -212,7 +212,7 @@ def _direct_interpreter(config: TacoConfig) -> Path:
         return venv_interpreter(config.project_root / ".venv")
 
     resolved = shutil.which("python") or shutil.which("python3")
-    return Path(resolved).resolve() if resolved else Path(sys.executable).resolve()
+    return _absolute_path(resolved) if resolved else Path(sys.executable).resolve()
 
 
 def _predicted_environment(interpreter: Path) -> Path:
@@ -936,6 +936,32 @@ def _emit_json(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _print_list_next_steps(records: list[dict[str, Any]]) -> None:
+    commands = dict.fromkeys(
+        shlex.join(
+            [
+                "taco",
+                "info",
+                "--project",
+                str(record["project"]),
+                "--name",
+                str(record["name"]),
+            ]
+        )
+        for record in records
+        if not record["healthy"] and record["managed_by_taco"] and record["project"]
+    )
+    if not commands:
+        return
+    console.print("\nNext:")
+    for command in commands:
+        console.print(f"  {command}", markup=False, soft_wrap=True)
+
+
+def _failed_check_names(record: dict[str, Any]) -> str:
+    return ", ".join(check["name"] for check in record["checks"] if not check["ok"])
+
+
 def run_setup(config: TacoConfig) -> None:
     """Create or refresh and verify a user-discoverable Python kernel."""
     _check_kernel_collision(config)
@@ -992,6 +1018,7 @@ def run_list(*, managed_only: bool = True, json_output: bool = False) -> None:
                 "interpreter": kernel["interpreter"],
                 "location": kernel["path"],
                 "healthy": health["healthy"],
+                "checks": health["checks"],
                 "managed_by_taco": kernel["managed_by_taco"],
                 "shadowed": kernel["shadowed"],
                 "error": kernel["error"],
@@ -1007,26 +1034,33 @@ def run_list(*, managed_only: bool = True, json_output: bool = False) -> None:
     if _plain_ui():
         for record in records:
             status = "healthy" if record["healthy"] else "unhealthy"
+            failed = _failed_check_names(record)
+            issue = f"\tfailed: {failed or 'unknown'}" if not record["healthy"] else ""
             console.print(
-                f"{record['name']}\t{status}\t{record['project'] or record['location']}",
+                f"{record['name']}\t{status}\t{record['project'] or record['location']}{issue}",
                 markup=False,
                 soft_wrap=True,
             )
+        _print_list_next_steps(records)
         return
     table = Table(title="Taco kernels" if managed_only else "Jupyter kernels")
     table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("Status")
     table.add_column("Project")
     table.add_column("Environment", style="dim")
+    table.add_column("Failed checks")
     for record in records:
         status = "[green]healthy[/green]" if record["healthy"] else "[red]unhealthy[/red]"
+        failed = _failed_check_names(record)
         table.add_row(
             escape(record["name"]),
             status,
             escape(record["project"] or "—"),
             escape(record["environment"] or "—"),
+            escape(failed or "—"),
         )
     console.print(table)
+    _print_list_next_steps(records)
 
 
 def run_info(config: TacoConfig, *, json_output: bool = False) -> bool:

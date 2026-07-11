@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -283,9 +284,36 @@ def clean(
     _call(lambda: run_clean(kernels=stale))
 
 
+def _flush_or_silence_broken_pipe() -> bool:
+    """Flush normal output, silencing a downstream consumer that closed its pipe."""
+    try:
+        sys.stdout.flush()
+        return True
+    except BrokenPipeError:
+        try:
+            stdout_fd = sys.stdout.fileno()
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull_fd, stdout_fd)
+            finally:
+                os.close(devnull_fd)
+        except (AttributeError, OSError, ValueError):
+            sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+        return False
+
+
 def cli() -> None:
     """Console-script wrapper used by python -m taco and packaging entry points."""
-    app()
+    try:
+        app()
+    except SystemExit as exc:
+        flushed = _flush_or_silence_broken_pipe()
+        if flushed or exc.code not in (None, 0):
+            raise
+    except BrokenPipeError:
+        _flush_or_silence_broken_pipe()
+    else:
+        _flush_or_silence_broken_pipe()
 
 
 if __name__ == "__main__":

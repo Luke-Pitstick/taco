@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -116,3 +119,27 @@ def test_clean_preserves_path_resolved_launcher(tmp_path: Path) -> None:
         run_clean()
 
     assert kernel_dir.is_dir()
+
+
+def test_console_script_exits_quietly_when_stdout_pipe_closes(tmp_path: Path) -> None:
+    data_dir = tmp_path / "jupyter"
+    env = os.environ.copy()
+    env["JUPYTER_DATA_DIR"] = str(data_dir)
+    taco = Path(sys.executable).with_name("taco.exe" if os.name == "nt" else "taco")
+    assert taco.is_file()
+    process = subprocess.Popen(
+        [taco, "list", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    process.stdout.close()
+    returncode = process.wait(timeout=10)
+    stderr = process.stderr.read()
+
+    assert returncode == 0, stderr
+    assert "BrokenPipeError" not in stderr
+    assert "Traceback" not in stderr

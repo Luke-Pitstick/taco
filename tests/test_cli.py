@@ -137,6 +137,48 @@ def test_list_json_is_one_document(tmp_path: Path, monkeypatch) -> None:
     assert payload == {"count": 0, "kernels": []}
 
 
+def test_list_json_explains_static_health_without_runtime_probe(
+    tmp_path: Path, monkeypatch
+) -> None:
+    project = _make_project(tmp_path)
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    _make_managed_kernel(data_dir, project)
+
+    with patch("taco.core._run") as run:
+        result = runner.invoke(app, ["list", "--json"])
+
+    assert result.exit_code == 0
+    record = json.loads(result.stdout)["kernels"][0]
+    assert [check["name"] for check in record["checks"]] == [
+        "kernelspec",
+        "launcher",
+        "project",
+        "environment",
+        "command",
+    ]
+    assert {check["name"] for check in record["checks"] if not check["ok"]} >= {
+        "environment",
+        "command",
+    }
+    run.assert_not_called()
+
+
+def test_list_human_output_names_failed_checks_and_next_step(tmp_path: Path, monkeypatch) -> None:
+    project = _make_project(tmp_path, name="forecast-project")
+    data_dir = tmp_path / "jupyter"
+    monkeypatch.setenv("JUPYTER_DATA_DIR", str(data_dir))
+    _make_managed_kernel(data_dir, project, name="forecasting-gpu")
+
+    result = runner.invoke(app, ["list"])
+
+    assert result.exit_code == 0
+    assert "failed:" in result.output
+    assert "environment" in result.output
+    assert "command" in result.output
+    assert f"taco info --project {project} --name forecasting-gpu" in result.output
+
+
 def test_info_missing_kernel_is_exit_one(tmp_path: Path, monkeypatch) -> None:
     project = _make_project(tmp_path)
     monkeypatch.setenv("JUPYTER_DATA_DIR", str(tmp_path / "jupyter"))
